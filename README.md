@@ -4,6 +4,9 @@
 这个插件是个人使用。所以后面大概率就不会去更新版本了。有实力的兄弟们可以自己更改。这个README也是deepseek写的。
 
    里面的json直接导入就可以了！！！在提一嘴我是用dsh跑的这个软件TauriTavern2.3的版本。
+
+
+   
  然后最后就是生成这个插件实在高峰时段。所以求求兄弟们赏给我一块钱回一下血。
 如果不愿意的话兄弟们拿走用就行了。
 <img width="1341" height="1827" alt="感谢兄弟们" src="https://github.com/user-attachments/assets/2c0c0111-c2ea-4174-826f-d5d9002f32f2" />
