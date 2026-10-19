@@ -1,0 +1,11 @@
+{
+  "display_name": "API 悬浮管家（移动版）",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "local",
+  "version": "0.6.7",
+  "homePage": ""
+}
