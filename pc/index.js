@@ -18,7 +18,7 @@
  */
 
 const MODULE_ID = 'tauri-api-manager';
-const VERSION = '0.6.7';
+const VERSION = '0.7.5';
 
 /* ------------------------------------------------------------------ *
  * 1. 工具
@@ -70,6 +70,16 @@ const DEFAULT_SETTINGS = {
   autoFailover: true,
   // 本机用量：{ days: { 'YYYY-MM-DD': { requests, prompt, completion, updatedAt } } }
   usage: { days: {} },
+  // 上下文管家：只动聊天历史，不碰角色卡 / 预设 / 世界书
+  context: {
+    auto: false,
+    threshold: 0.8,
+    keepTurns: 6,
+    strategy: 'summary',
+    autoEvery: 0,
+    budgetOverride: 0,
+    summaryChars: 240,
+  },
 };
 
 let isHostReady = false;
@@ -134,6 +144,17 @@ function mergeItemKeys(hostItems, localItems) {
   return merged;
 }
 
+function dropLegacySnapshots(settings) {
+  try {
+    if (settings?.context && Object.hasOwn(settings.context, 'snapshots')) {
+      delete settings.context.snapshots;
+    }
+  } catch {
+    /* ignore */
+  }
+  return settings;
+}
+
 function readSettings() {
   let hostStored = null;
   // 1) 宿主的 extension_settings（如果存在）
@@ -159,9 +180,9 @@ function readSettings() {
   if (hostStored) {
     const merged = { ...clone(DEFAULT_SETTINGS), ...hostStored };
     merged.items = mergeItemKeys(merged.items, mirror?.items);
-    return merged;
+    return dropLegacySnapshots(merged);
   }
-  if (mirror) return { ...clone(DEFAULT_SETTINGS), ...mirror };
+  if (mirror) return dropLegacySnapshots({ ...clone(DEFAULT_SETTINGS), ...mirror });
   return clone(DEFAULT_SETTINGS);
 }
 
@@ -430,6 +451,32 @@ function fromConnection(connection) {
 
 /* ---- 宿主机密存储（SillyTavern /api/secrets/*） ---- */
 
+let stSecretsModulePromise = null;
+
+/**
+ * 我们直接调用 /api/secrets/rotate 后，ST 自己内存里的 secret_state 仍是旧快照，
+ * 导致它的状态检查继续拿旧 secret_id。这里尝试调用 ST 自己的 readSecretState()
+ * 刷新缓存；普通酒馆/取不到模块时静默跳过。
+ */
+async function refreshSTSecretState() {
+  try {
+    if (!stSecretsModulePromise) {
+      stSecretsModulePromise = import('/scripts/secrets.js');
+    }
+    const mod = await stSecretsModulePromise;
+    if (typeof mod?.readSecretState === 'function') {
+      await Promise.race([
+        Promise.resolve(mod.readSecretState()).catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 2500)),
+      ]);
+      return true;
+    }
+  } catch {
+    stSecretsModulePromise = null;
+  }
+  return false;
+}
+
 const secrets = {
   /**
    * 把明文密钥写进宿主机密存储，返回 secretRef。
@@ -447,6 +494,7 @@ const secrets = {
         console.warn('[API 管家] /api/secrets/write 返回', res.status);
         return null;
       }
+      await refreshSTSecretState();
       const data = await res.json().catch(() => ({}));
       let id = data?.id ?? data?.secret?.id ?? data?.data?.id ?? null;
 
@@ -500,6 +548,7 @@ const secrets = {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ key, id }),
       });
+      if (res.ok) await refreshSTSecretState();
       return res.ok;
     } catch (err) {
       console.warn('[API 管家] 切换密钥失败', err);
@@ -723,6 +772,9 @@ const connTest = {
   },
 };
 
+// 串行化切换：连点 / 并发调用时排队执行，避免 URL 与模型互相覆盖
+let activateQueue = Promise.resolve();
+
 const store = {
   /** 返回 [{ id, name, baseUrl, provider, model, source }] */
   async listConnections() {
@@ -903,7 +955,14 @@ const store = {
    *    并点一下「连接」按钮——这一步才真正让酒馆的对话用上新 API；
    * 3. 顺带把 Agent Profile 的 connectionRef 指过去（TauriTavern 的 Agent 用）。
    */
-  async activate(connection) {
+  async activate(connection, options = {}) {
+    const run = () => this._activate(connection, options);
+    const task = activateQueue.then(run, run);
+    activateQueue = task.then(() => undefined, () => undefined);
+    return task;
+  },
+
+  async _activate(connection, options = {}) {
     if (hostGateActive()) {
       toast('宿主连接中，请稍后…');
       return { ok: true, applied: false, reason: '宿主连接中，请稍后…' };
@@ -957,10 +1016,24 @@ const store = {
       settings.activeId = connection.id;
       saveSettings();
       const suffix = '（设置已写入；如未生效，请在酒馆 API 面板手动点一次「连接」）';
+
+      // 点击「使用」时顺带做一次真实连通性测试，结果显示在 toast 里
+      let test = null;
+      if (options.test) {
+        toast('已切换，正在测试连接…');
+        test = await connTest.run(connection);
+        if (test?.ok) {
+          // 扩展自己的测试通过后，再让酒馆做一次正常状态检查：
+          // 这样插头会变绿、发送按钮恢复，省掉用户手动点「连接」。
+          triggerTavernStatusCheck();
+        }
+      }
+
       return {
         ok: true,
         applied: true,
         reason: (agent.applied ? '已切换酒馆 API 并更新 Agent Profile' : '已切换酒馆 API') + suffix,
+        test,
       };
     }
     return {
@@ -1014,7 +1087,74 @@ function getChatSettings() {
   return null;
 }
 
-async function applyToTavern(connection) {
+/** 切换来源时酒馆会自动触发一次「连接」测试；这里临时拦掉，改由扩展自己测试。 */
+let connectClickMuteUntil = 0;
+
+function muteConnectClicks(ms = 1500) {
+  connectClickMuteUntil = Date.now() + ms;
+}
+
+function installConnectClickGuard() {
+  if (installConnectClickGuard.done) return;
+  installConnectClickGuard.done = true;
+  document.addEventListener('click', (event) => {
+    if (Date.now() > connectClickMuteUntil) return;
+    const target = event.target;
+    if (!target?.closest) return;
+    if (target.closest('#api_button_openai, #api_button')) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
+}
+
+/** 同时更新 input 和 select 两种模型控件，避免 ST 的 source change 把模型重置成旧值。 */
+function modelControlsFor(source) {
+  const selectors = source === 'custom'
+    ? ['#model_custom_select', '#custom_model_id']
+    : [`#model_${source}_select`, `#model_${source}`, '#custom_model_id'];
+  return [...new Set(selectors.map((selector) => document.querySelector(selector)).filter(Boolean))];
+}
+
+function setModelControl(control, value) {
+  if (!control || !value) return;
+  if (control.tagName === 'SELECT') {
+    if (![...control.options].some((option) => option.value === value)) {
+      control.append(optionElement(value, value));
+    }
+    control.value = value;
+  } else {
+    control.value = value;
+  }
+  fire(control, 'input');
+  fire(control, 'change');
+}
+
+/** 在酒馆自己的「暂停连接校验」作用域里改设置，避免自动状态检查弹红色错误。 */
+let stMainModulePromise = null;
+async function withSTValidationSuspended(reason, callback) {
+  try {
+    if (!stMainModulePromise) stMainModulePromise = import('/script.js');
+    const mod = await stMainModulePromise;
+    if (typeof mod?.withConnectionValidationSuspended === 'function') {
+      return await mod.withConnectionValidationSuspended(reason, callback);
+    }
+  } catch {
+    stMainModulePromise = null;
+  }
+  return callback();
+}
+
+/** 切换/测试成功后主动触发一次酒馆自己的状态检查，让插头变绿、发送按钮恢复。 */
+function triggerTavernStatusCheck() {
+  connectClickMuteUntil = 0;
+  const button = findConnectButton();
+  if (!button) return false;
+  button.click();
+  return true;
+}
+
+function applyToTavern(connection) {
   const source = sourceOf(connection);
   const targetSource = source === 'custom' ? 'custom' : source;
   const url = source === 'custom' && connection.baseUrl ? tavernBaseUrl(connection.baseUrl) : '';
@@ -1032,47 +1172,31 @@ async function applyToTavern(connection) {
     return { applied: false, reason: '未找到酒馆 API 设置（#main_api / #chat_completion_source / oai_settings 都不可用）' };
   }
 
-  try {
-    // 1) 先把地址 / 模型填进控件，再切来源——否则切换处理器可能读到空地址而回退
-    const urlInput = document.querySelector('#custom_api_url_text');
-    if (url && urlInput) urlInput.value = url;
+  const run = async () => {
+    try {
+      const saveTavernSettings = () => {
+        const ctx = getSTContext();
+        (ctx?.saveSettingsDebounced ?? globalThis.saveSettingsDebounced)?.();
+      };
 
-    const modelNode =
-      targetSource === 'custom'
-        ? (document.querySelector('#custom_model_id') ?? document.querySelector('#model_custom_select'))
-        : (document.querySelector(`#model_${targetSource}_select`) ??
-          document.querySelector(`#model_${targetSource}`) ??
-          document.querySelector('#custom_model_id'));
-    if (connection.model && modelNode) modelNode.value = connection.model;
+    // ST 的 source change 会把模型控件重置成旧值，所以每次都要在切完来源后重新写一遍
+    const applyControls = () => {
+      const urlNode = document.querySelector('#custom_api_url_text');
+      if (url && urlNode) {
+        urlNode.value = url;
+        fire(urlNode, 'input');
+        fire(urlNode, 'change');
+      }
+      if (connection.model) {
+        for (const control of modelControlsFor(targetSource)) {
+          setModelControl(control, connection.model);
+        }
+      }
+    };
 
-    // 2) 主 API 切到「聊天补全」，等宿主的 change 处理器跑完
-    const apiSelect = document.querySelector('#main_api');
-    if (apiSelect) {
-      setSelectValue(apiSelect, 'openai');
-      await sleep(150);
-    }
-
-    // 3) 来源切到 custom（或对应提供商）
-    const sourceSelect = document.querySelector('#chat_completion_source');
-    if (sourceSelect) {
-      setSelectValue(sourceSelect, targetSource);
-      await sleep(150);
-    }
-
-    // 4) 触发地址 / 模型控件的更新事件，让宿主把它们读进设置
-    if (urlInput && url) {
-      fire(urlInput, 'input');
-      fire(urlInput, 'change');
-    }
-    if (connection.model && modelNode) {
-      fire(modelNode, 'input');
-      fire(modelNode, 'change');
-    }
-    await sleep(150);
-
-    // 5) 最后一步强制写入设置在内存中的真身，保证请求一定用新值
-    const settings = getChatSettings();
-    if (settings) {
+    const commitSettings = () => {
+      const settings = getChatSettings();
+      if (!settings) return null;
       settings.chat_completion_source = targetSource;
       if (url) settings.custom_url = url;
       if (connection.model) {
@@ -1082,29 +1206,81 @@ async function applyToTavern(connection) {
         // 切换到一个没有模型的 custom 连接时清空旧模型，避免沿用上一条的
         settings.custom_model = '';
       }
-    }
-    const ctx = getSTContext();
-    (ctx?.saveSettingsDebounced ?? globalThis.saveSettingsDebounced)?.();
-    await sleep(150);
+      return settings;
+    };
 
-    // 6) 校验是否真的生效
-    const verify = getChatSettings();
-    const actualSource = verify?.chat_completion_source;
-    const actualUrl = verify?.custom_url;
-    const ok = actualSource === targetSource && (!url || actualUrl === url);
-    if (!ok) {
+    const verifyApplied = () => {
+      const settings = getChatSettings();
+      if (!settings) return { ok: false, source: null, url: null, model: null };
+      const actualSource = settings.chat_completion_source;
+      const actualUrl = settings.custom_url;
+      const actualModel = targetSource === 'custom'
+        ? settings.custom_model
+        : settings[`${targetSource}_model`];
+      return {
+        ok:
+          actualSource === targetSource &&
+          (!url || normalizeBaseUrl(actualUrl) === normalizeBaseUrl(url)) &&
+          (!connection.model || actualModel === connection.model),
+        source: actualSource,
+        url: actualUrl,
+        model: actualModel,
+      };
+    };
+
+    // 1) 先把地址填进控件，再切来源——否则切换处理器可能读到空地址而回退
+    const urlInput = document.querySelector('#custom_api_url_text');
+    if (url && urlInput) urlInput.value = url;
+
+    // 2) 主 API 切到「聊天补全」，等宿主的 change 处理器跑完
+    muteConnectClicks(2000);
+    const apiSelect = document.querySelector('#main_api');
+    if (apiSelect) {
+      setSelectValue(apiSelect, 'openai');
+      await sleep(150);
+    }
+
+    // 3) 来源切到 custom（或对应提供商）
+    let sourceSelect = document.querySelector('#chat_completion_source');
+    if (sourceSelect) {
+      setSelectValue(sourceSelect, targetSource);
+      await sleep(200);
+    }
+
+    // 4) 最多重试 3 次：ST 的 change 处理器可能异步把 URL/模型/来源改回旧值
+    let verify = verifyApplied();
+    for (let attempt = 0; attempt < 3 && !verify.ok; attempt += 1) {
+      // 只有来源本身没写进去时才再次触发 source change；仅 URL/模型被重置时
+      // 直接重写控件和设置，避免反复 toggle 表单造成界面闪动。
+      if (attempt > 0 && verify.source !== targetSource) {
+        muteConnectClicks(1500);
+        sourceSelect = document.querySelector('#chat_completion_source');
+        if (sourceSelect) {
+          setSelectValue(sourceSelect, targetSource);
+          await sleep(150);
+        }
+      }
+      applyControls();
+      commitSettings();
+      saveTavernSettings();
+      await sleep(220);
+      verify = verifyApplied();
+    }
+
+    if (!verify.ok) {
       return {
         applied: false,
-        reason: `设置未生效（来源 ${actualSource ?? '未知'}，地址 ${actualUrl ?? '空'}）`,
+        reason: `设置未生效（来源 ${verify.source ?? '未知'}，地址 ${verify.url ?? '空'}，模型 ${verify.model ?? '空'}）`,
       };
     }
 
-    // 7) 不再自动点「连接」：酒馆会立刻发一次测试请求，失败时弹巨大的红色 Toastr。
-    //    设置已经写入内存/控件，下一次对话会直接使用新配置。
-    return { applied: true, connectTriggered: false };
-  } catch (err) {
-    return { applied: false, reason: `写入酒馆设置失败：${String(err?.message ?? err)}` };
-  }
+    return { applied: true };
+    } catch (err) {
+      return { applied: false, reason: `写入酒馆设置失败：${String(err?.message ?? err)}` };
+    }
+  };
+
+  return withSTValidationSuspended('API 管家切换', run);
 }
 
 /** 找酒馆的「连接」按钮：优先聊天补全的 #api_button_openai，其次旧 id，最后按文本兜底。 */
@@ -1370,6 +1546,7 @@ async function maybeFailover(status) {
     if (!result.applied) return;
 
     toast(`检测到${status === 429 ? '限流' : '密钥失效'}，已自动切换至：${next.name || '下一条 API'}。为避免重复发送，请手动重发上一条消息。`);
+    ui.setActiveRow(next.id);
   } catch (err) {
     console.warn('[API 管家] 自动切换失败', err);
   } finally {
@@ -1590,18 +1767,19 @@ function buildUi() {
   );
 
   const tabs = el('nav', { class: 'tam-tabs' },
-    ...['connections', 'usage', 'probe'].map((key) =>
+    ...['connections', 'usage', 'probe', 'context'].map((key) =>
       el('button', {
         class: 'tam-tab',
         dataset: { tab: key },
         onclick: () => ui.setTab(key),
-      }, { connections: '连接', usage: '用量', probe: '诊断' }[key]),
+      }, { connections: '连接', usage: '用量', probe: '诊断', context: '上下文' }[key]),
     ),
   );
 
   const list = el('div', { class: 'tam-body', id: 'tam-connections' });
   const usageBody = el('div', { class: 'tam-body tam-hidden', id: 'tam-usage' });
   const probeBody = el('div', { class: 'tam-body tam-hidden', id: 'tam-probe' });
+  const contextBody = el('div', { class: 'tam-body tam-hidden', id: 'tam-context' });
 
   const footer = el('footer', { class: 'tam-footer' },
     el('button', { class: 'tam-primary', onclick: () => ui.openForm(null) }, iconSpan('plus', 15), '新增 API'),
@@ -1631,7 +1809,7 @@ function buildUi() {
     }),
   );
 
-  const panel = el('section', { id: 'tam-panel' }, header, tabs, list, usageBody, probeBody, footer);
+  const panel = el('section', { id: 'tam-panel' }, header, tabs, list, usageBody, probeBody, contextBody, footer);
 
   root.append(fab, panel);
 
@@ -1713,10 +1891,13 @@ function buildUi() {
   ui.listEl = list;
   ui.usageEl = usageBody;
   ui.probeEl = probeBody;
+  ui.contextEl = contextBody;
+  ui.footerEl = footer;
   ui.tabs = [...tabs.querySelectorAll('.tam-tab')];
 
   enableDrag(header, panel);
   enableFabDrag(fab);
+  installConnectClickGuard();
   ui.restoreFab();
   ui.restorePanel();
   window.addEventListener('resize', () => {
@@ -1872,8 +2053,12 @@ ui.setTab = (tab) => {
   $id('tam-connections').classList.toggle('tam-hidden', tab !== 'connections');
   ui.usageEl.classList.toggle('tam-hidden', tab !== 'usage');
   ui.probeEl.classList.toggle('tam-hidden', tab !== 'probe');
+  ui.contextEl?.classList.toggle('tam-hidden', tab !== 'context');
+  ui.footerEl?.classList.toggle('tam-hidden', tab === 'context');
+  ui.panel?.classList.toggle('tam-ctx-tall', tab === 'context');
   if (tab === 'usage') renderUsage();
   if (tab === 'probe') renderProbe();
+  if (tab === 'context') void renderContext();
 };
 
 ui.refreshHostBadge = () => {
@@ -1963,7 +2148,10 @@ async function renderConnections() {
     const subParts = [hostOf(connection.baseUrl) || '未填 Base URL'];
     if (connection.model) subParts.push(connection.model);
     if (maskedKey) subParts.push(maskedKey);
-    const row = el('div', { class: `tam-row${active ? ' is-active' : ''}` },
+    const row = el('div', {
+      class: `tam-row${active ? ' is-active' : ''}`,
+      dataset: { id: connection.id ?? '' },
+    },
       el('div', { class: 'tam-avatar', dataset: { tone: providerTone(connection.provider) } }, initial),
       el('div', { class: 'tam-row-main' },
         el('div', { class: 'tam-row-title' },
@@ -1985,6 +2173,27 @@ async function renderConnections() {
 
 /* ---- 用量渲染 ---- */
 
+/** 切换成功后原地更新「当前」标记，避免整表重渲染造成闪动。 */
+ui.setActiveRow = (id) => {
+  const list = ui.listEl;
+  if (!list) return;
+  const target = String(id ?? '');
+  for (const row of list.querySelectorAll('.tam-row')) {
+    const active = row.dataset.id === target;
+    row.classList.toggle('is-active', active);
+    const title = row.querySelector('.tam-row-title');
+    if (!title) continue;
+    const chip = title.querySelector('.tam-chip.is-accent');
+    if (active && !chip) {
+      const name = title.querySelector('.tam-name');
+      const node = el('span', { class: 'tam-chip is-accent' }, '当前');
+      if (name?.nextSibling) title.insertBefore(node, name.nextSibling);
+      else title.append(node);
+    } else if (!active && chip) {
+      chip.remove();
+    }
+  }
+};
 function usageStat(label, value) {
   const full = Math.max(0, Math.floor(Number(value) || 0));
   return el('div', { class: 'tam-stat' },
@@ -2099,6 +2308,1000 @@ function renderProbe() {
     ),
     el('pre', { class: 'tam-pre tam-hidden', id: 'tam-format-probe' }),
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * 7.5 上下文管家：压缩 / 隐藏 / 撤销
+ * 只操作聊天消息；角色卡、预设、世界书一律只读。
+ * ------------------------------------------------------------------ */
+
+const CTX_PROMPT_KEY = 'tam_ctx_summary';
+const CTX_META_KEY = 'tamCtx';
+const CTX_ROWS = 14;
+const CTX_BUDGET_CHOICES = [
+  [0, '跟随酒馆'],
+  [10000, '1 万'],
+  [30000, '3 万'],
+  [50000, '5 万'],
+  [70000, '7 万'],
+  [90000, '9 万'],
+  [110000, '11 万'],
+  [130000, '13 万'],
+  [150000, '15 万'],
+  [200000, '20 万'],
+  [300000, '30 万'],
+  [500000, '50 万'],
+];
+
+let ctxBusy = false;
+let ctxGenerating = false;
+let ctxSettingsOpen = false;
+let ctxLastAutoAt = 0;
+const ctxSelected = new Set();
+const ctxTokenMap = new Map();
+const ctxTextMap = new Map();
+let ctxChatsModulePromise = null;
+
+function ctxSettings() {
+  const stored = loadSettings().context;
+  return { ...DEFAULT_SETTINGS.context, ...(stored && typeof stored === 'object' ? stored : {}) };
+}
+
+function saveCtxSettings(patch) {
+  const settings = loadSettings();
+  const stored = settings.context;
+  settings.context = {
+    ...DEFAULT_SETTINGS.context,
+    ...(stored && typeof stored === 'object' ? stored : {}),
+    ...patch,
+  };
+  saveSettings();
+  return settings.context;
+}
+
+async function ctxST() {
+  try {
+    if (!stMainModulePromise) stMainModulePromise = import('/script.js');
+    return await stMainModulePromise;
+  } catch (err) {
+    console.warn('[API 管家] 加载 script.js 失败', err);
+    return null;
+  }
+}
+
+function ctxChatMetadata() {
+  try {
+    return getSTContext()?.chatMetadata ?? globalThis.chat_metadata ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** 当前聊天的消息快照；文本为空的消息（楼层占位）跳过。 */
+function ctxMessages(chatInput) {
+  const ctx = getSTContext();
+  const chat = Array.isArray(chatInput)
+    ? chatInput
+    : Array.isArray(ctx?.chat)
+      ? ctx.chat
+      : Array.isArray(globalThis.chat)
+        ? globalThis.chat
+        : [];
+  return chat
+    .map((message, index) => ({
+      index,
+      name: String(message?.name ?? (message?.is_user ? 'User' : 'Character')),
+      isUser: !!message?.is_user,
+      hidden: !!message?.is_system,
+      text: String(message?.mes ?? ''),
+    }))
+    .filter((message) => message.text.length > 0);
+}
+
+/**
+ * 取当前聊天数组。TauriTavern / 手机端有时 getContext().chat 是空快照，
+ * 这时退回 script.js 的 live binding，再退回全局 chat。
+ */
+async function ctxResolveChat() {
+  const ctx = getSTContext();
+  if (Array.isArray(ctx?.chat) && ctx.chat.length) return { chat: ctx.chat, source: 'context' };
+  if (Array.isArray(globalThis.chat) && globalThis.chat.length) return { chat: globalThis.chat, source: 'global' };
+  const st = await ctxST();
+  if (Array.isArray(st?.chat) && st.chat.length) return { chat: st.chat, source: 'module' };
+  return { chat: Array.isArray(ctx?.chat) ? ctx.chat : [], source: 'empty' };
+}
+
+function ctxBudget() {
+  const settings = getChatSettings() ?? {};
+  const rawLimit = Number(settings.openai_max_context) || 0;
+  const rawReserve = Number(settings.openai_max_tokens) || 0;
+  const override = Number(ctxSettings().budgetOverride) || 0;
+  const limit = override > 0
+    ? (rawLimit > 0 ? Math.min(override, rawLimit) : override)
+    : (rawLimit || 8192);
+  const reserve = Math.min(rawReserve, Math.floor(limit * 0.35));
+  return { limit, reserve, usable: Math.max(512, limit - reserve), rawLimit, rawReserve, override };
+}
+
+/** 中文按 ~1.4 字/token，英文按 ~3.8 字符/token；只在拿不到宿主分词器时用。 */
+function ctxEstimate(text) {
+  let cjk = 0;
+  let other = 0;
+  for (const ch of String(text ?? '')) {
+    if (/[\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff00-\uffef]/.test(ch)) cjk += 1;
+    else other += 1;
+  }
+  return Math.ceil(cjk * 0.72 + other / 3.8);
+}
+
+function ctxModel() {
+  const settings = getChatSettings() ?? {};
+  return String(settings.custom_model || settings.model || 'gpt-4').trim() || 'gpt-4';
+}
+
+function ctxPayload(messages) {
+  return messages.map((message) => ({
+    role: message.isUser ? 'user' : 'assistant',
+    content: message.text,
+  }));
+}
+
+/** 整段请求的精确 token 数（和酒馆 Prompt Manager 同一套接口）。 */
+async function ctxCountTotal(messages) {
+  const payload = ctxPayload(messages);
+  try {
+    const res = await fetch(`/api/tokenizers/openai/count?model=${encodeURIComponent(ctxModel())}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (Number.isFinite(data?.token_count)) return { tokens: data.token_count, exact: true };
+    }
+  } catch {
+    /* 旧宿主没有这个路由，走估算 */
+  }
+  return { tokens: payload.reduce((sum, item) => sum + ctxEstimate(item.content) + 4, 3), exact: false };
+}
+
+/** 逐条 token 数（列表展示用）。 */
+async function ctxCountEach(messages) {
+  const payload = ctxPayload(messages);
+  try {
+    const res = await fetch(`/api/tokenizers/openai/count-batch?model=${encodeURIComponent(ctxModel())}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (Array.isArray(data?.token_counts) && data.token_counts.length === payload.length) {
+        return { counts: data.token_counts, exact: true };
+      }
+    }
+  } catch {
+    /* 同上 */
+  }
+  return { counts: payload.map((item) => ctxEstimate(item.content) + 4), exact: false };
+}
+
+function ctxActiveConnection() {
+  const settings = loadSettings();
+  const items = Array.isArray(settings.items) ? settings.items : [];
+  const id = settings.activeId;
+  return items.find((item) => item.id === id || item.hostId === id)
+    ?? items.find((item) => item.active)
+    ?? items[0]
+    ?? null;
+}
+
+async function ctxConnectionKey(connection) {
+  if (connection?.key) return connection.key;
+  try {
+    const list = await secrets.list(`api_key_${sourceOf(connection)}`);
+    const hit = list.find((secret) => secret.id === connection?.secretId)
+      ?? list.find((secret) => secret.active)
+      ?? list[0];
+    return hit?.value ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function ctxSummaryPrompt(transcript, chars) {
+  const max = Math.max(120, Number(chars) || 240);
+  return [
+    '你是剧情压缩器。把下面这段角色扮演对话压成一条「前情提要」。',
+    '',
+    '保留：',
+    '- 人物关系与称呼的变化',
+    '- 已发生的关键事件、因果与时间顺序',
+    '- 未兑现的承诺、约定、物品、地点、伤势',
+    '- 角色当前的情绪、位置、对彼此的态度',
+    '',
+    '不要编造，不要评价，不要用第一人称。',
+    `输出 ${Math.max(120, max - 60)}–${max} 字的中文段落，不要分点，不要标题。`,
+    '',
+    '对话：',
+    transcript,
+  ].join('\n');
+}
+
+/** 优先走 getContext，拿不到再退回 import('/script.js')（兼容非官方版/手机端）。 */
+async function ctxSetPrompt(text) {
+  const ctx = getSTContext();
+  if (typeof ctx?.setExtensionPrompt === 'function') {
+    try {
+      ctx.setExtensionPrompt(CTX_PROMPT_KEY, text, 1, 4, false, 0);
+      return true;
+    } catch {
+      /* fallthrough */
+    }
+  }
+  const st = await ctxST();
+  try {
+    st?.setExtensionPrompt?.(CTX_PROMPT_KEY, text, 1, 4, false, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function ctxSaveChat() {
+  const ctx = getSTContext();
+  if (typeof ctx?.saveChat === 'function') {
+    try {
+      await ctx.saveChat();
+      return true;
+    } catch {
+      /* fallthrough */
+    }
+  }
+  const st = await ctxST();
+  try {
+    await st?.saveChatConditional?.();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 一次摘要最多处理 4 万字符：80 轮长聊天不会撑爆请求或超时。 */
+const CTX_SUMMARY_CHAR_LIMIT = 40000;
+const CTX_MSG_CHAR_CAP = 8000;
+function ctxBatchMessages(target, limit = CTX_SUMMARY_CHAR_LIMIT) {
+  const batch = [];
+  let chars = 0;
+  for (const message of target) {
+    const size = Math.min(message.text.length, CTX_MSG_CHAR_CAP);
+    if (chars + size > limit && batch.length >= 4) break;
+    batch.push(message);
+    chars += size;
+  }
+  return batch.length ? batch : target.slice(0, 4);
+}
+
+/** 保留最近 keepTurns 轮，其余作为压缩目标。首楼永远不压。 */
+function ctxPlan(keepTurns, chatInput) {
+  const visible = ctxMessages(chatInput).filter((message) => !message.hidden);
+  const keep = Math.max(2, Number(keepTurns) || 6) * 2;
+  const target = visible
+    .slice(0, Math.max(0, visible.length - keep))
+    .filter((message) => message.index > 0);
+  return { visible, target, keep };
+}
+
+async function ctxApplySummary(summary, ranges, auto) {
+  await ctxSetPrompt(`【前情提要】\n${summary}`);
+  const chats = await ctxChats();
+  for (const [from, to] of ranges) {
+    try {
+      if (chats?.hideChatMessageRange) await chats.hideChatMessageRange(from, to, false);
+    } catch (err) {
+      console.warn('[API 管家] 隐藏旧消息失败', err);
+    }
+  }
+  const meta = ctxChatMetadata();
+  if (meta) {
+    meta[CTX_META_KEY] = { summary, ranges, start: ranges[0]?.[0] ?? 0, end: ranges.at(-1)?.[1] ?? 0, at: Date.now(), auto: !!auto, version: 2 };
+  }
+  await ctxSaveChat();
+}
+
+async function ctxApplyHideOnly(ranges) {
+  const chats = await ctxChats();
+  for (const [from, to] of ranges) {
+    try {
+      if (chats?.hideChatMessageRange) await chats.hideChatMessageRange(from, to, false);
+    } catch (err) {
+      console.warn('[API 管家] 隐藏消息失败', err);
+    }
+  }
+  const meta = ctxChatMetadata();
+  if (meta) {
+    meta[CTX_META_KEY] = { mode: 'hide', ranges, start: ranges[0]?.[0] ?? 0, end: ranges.at(-1)?.[1] ?? 0, at: Date.now(), version: 2 };
+  }
+  await ctxSaveChat();
+}
+
+async function ctxCompress({ auto = false, strategy = null } = {}) {
+  if (ctxBusy) return null;
+  if (!auto && ctxGenerating) {
+    toast('正在生成回复，稍后再试');
+    return null;
+  }
+  ctxBusy = true;
+  let timer = null;
+  try {
+    const settings = ctxSettings();
+    const mode = strategy ?? settings.strategy ?? 'summary';
+    const { chat } = await ctxResolveChat();
+    const { visible, target } = ctxPlan(settings.keepTurns, chat);
+    if (target.length < 2) {
+      if (!auto) {
+        toast(visible.length
+          ? `只有 ${visible.length} 条可见消息，保留最近 ${settings.keepTurns} 轮后没有可压缩内容`
+          : '还没有聊天记录');
+      }
+      return null;
+    }
+    const batch = ctxBatchMessages(target);
+    const ranges = ctxGroupRanges(batch.map((message) => message.index));
+
+    if (mode === 'hide') {
+      await ctxApplyHideOnly(ranges);
+      toast(`已隐藏 ${batch.length} 条旧消息`);
+      if (ui.currentTab === 'context') void renderContext();
+      return { ranges, count: target.length };
+    }
+
+    const connection = ctxActiveConnection();
+    if (!connection) {
+      if (!auto) toast('没有激活的 API 连接');
+      return null;
+    }
+    const base = normalizeBaseUrl(connection.baseUrl);
+    if (!base) {
+      if (!auto) toast('当前连接缺少 Base URL');
+      return null;
+    }
+
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), 30000);
+    const key = await ctxConnectionKey(connection);
+    const transcript = batch
+      .map((message) => {
+        const text = message.text.length > CTX_MSG_CHAR_CAP
+          ? `${message.text.slice(0, CTX_MSG_CHAR_CAP)}…[本条已截断]`
+          : message.text;
+        return `${message.isUser ? '用户' : message.name}：${text}`;
+      })
+      .join('\n');
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(key ? { Authorization: `Bearer ${key}` } : {}),
+      },
+      body: JSON.stringify({
+        model: connection.model || ctxModel(),
+        messages: [{ role: 'user', content: ctxSummaryPrompt(transcript, settings.summaryChars) }],
+        temperature: 0.3,
+        max_tokens: 800,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const reason = res.status === 401
+        ? '密钥无效或未授权'
+        : res.status === 429
+          ? '已限流，请稍后再试'
+          : `HTTP ${res.status}`;
+      throw new Error(reason);
+    }
+    const data = await res.json().catch(() => ({}));
+    const summary = String(data?.choices?.[0]?.message?.content ?? '').trim();
+    if (!summary) throw new Error('摘要为空');
+
+    await ctxApplySummary(summary, ranges, auto);
+    const extra = batch.length < target.length ? `（本次处理最早的 ${batch.length} 条）` : '';
+    toast(auto
+      ? `已自动压缩 ${batch.length} 条旧消息${extra}`
+      : `已压缩 ${batch.length} 条 · 摘要 ${summary.length} 字${extra}`);
+    if (ui.currentTab === 'context') void renderContext();
+    return { summary, ranges, count: batch.length };
+  } catch (err) {
+    const message = err?.name === 'AbortError' ? '压缩请求超时（30 秒）' : String(err?.message ?? err);
+    if (!auto) toast(`压缩失败：${message}`);
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+    ctxBusy = false;
+  }
+}
+
+async function ctxUndo() {
+  const meta = ctxChatMetadata()?.[CTX_META_KEY];
+  if (!meta) {
+    toast('没有可撤销的压缩');
+    return;
+  }
+  const ranges = Array.isArray(meta.ranges) && meta.ranges.length ? meta.ranges : [[meta.start, meta.end]];
+  const chats = await ctxChats();
+  if (!chats?.hideChatMessageRange) {
+    toast('宿主不支持取消隐藏');
+    return;
+  }
+  try {
+    for (const [from, to] of ranges) {
+      await chats.hideChatMessageRange(from, to, true);
+    }
+    await ctxSetPrompt('');
+    delete ctxChatMetadata()[CTX_META_KEY];
+    await ctxSaveChat();
+    const count = ranges.reduce((sum, [from, to]) => sum + (to - from + 1), 0);
+    toast(`已恢复 ${count} 条消息`);
+    if (ui.currentTab === 'context') void renderContext();
+  } catch (err) {
+    toast(`撤销失败：${String(err?.message ?? err)}`);
+  }
+}
+
+/** 一键取消所有隐藏，并清掉注入的摘要。 */
+async function ctxUnhideAll() {
+  const { chat } = await ctxResolveChat();
+  if (!chat.length) {
+    toast('还没有聊天记录');
+    return;
+  }
+  const chats = await ctxChats();
+  try {
+    await chats?.hideChatMessageRange?.(0, chat.length - 1, true);
+  } catch (err) {
+    toast(`取消隐藏失败：${String(err?.message ?? err)}`);
+    return;
+  }
+  await ctxSetPrompt('');
+  const meta = ctxChatMetadata();
+  if (meta) delete meta[CTX_META_KEY];
+  await ctxSaveChat();
+  ctxSelected.clear();
+  toast('已取消全部隐藏');
+  if (ui.currentTab === 'context') void renderContext();
+}
+
+/** 切换聊天后把摘要重新注入（extension prompt 不随聊天保存）。 */
+async function ctxReapply() {
+  const meta = ctxChatMetadata()?.[CTX_META_KEY];
+  if (!meta?.summary) return;
+  await ctxSetPrompt(`【前情提要】\n${meta.summary}`);
+}
+
+function ctxAutoDecision({ settings, visible, meta, tokens, usable }) {
+  const lastEnd = Number(meta?.end ?? -1);
+  const roundsSince = visible.filter((message) => message.index > lastEnd && !message.isUser).length;
+  const every = Number(settings?.autoEvery) || 0;
+  const byCount = every > 0 && roundsSince >= every;
+  const byRatio = Number(usable) > 0 && Number(tokens) / Number(usable) >= Number(settings?.threshold || 0.8);
+  return { byCount, byRatio, trigger: byCount || byRatio, roundsSince };
+}
+
+async function ctxAutoMaybe() {
+  const settings = ctxSettings();
+  if (!settings.auto || ctxBusy) return;
+  if (Date.now() - ctxLastAutoAt < 15000) return;
+  const { chat } = await ctxResolveChat();
+  const { visible, target } = ctxPlan(settings.keepTurns, chat);
+  if (target.length < 2) return;
+
+  const meta = ctxChatMetadata()?.[CTX_META_KEY];
+  let tokens = 0;
+  const decision = ctxAutoDecision({ settings, visible, meta, tokens, usable: ctxBudget().usable });
+  if (!decision.byCount) {
+    const budget = ctxBudget();
+    const total = await ctxCountTotal(visible);
+    tokens = total.tokens;
+    Object.assign(decision, ctxAutoDecision({ settings, visible, meta, tokens, usable: budget.usable }));
+  }
+  if (!decision.trigger) return;
+
+  ctxLastAutoAt = Date.now();
+  await ctxCompress({ auto: true });
+}
+
+async function ctxInstallHooks() {
+  try {
+    const st = await ctxST();
+    const events = st?.event_types ?? {};
+    st?.eventSource?.on?.(events.GENERATION_STARTED, () => {
+      ctxGenerating = true;
+    });
+    st?.eventSource?.on?.(events.GENERATION_STOPPED, () => {
+      ctxGenerating = false;
+    });
+    st?.eventSource?.on?.(events.GENERATION_ENDED, () => {
+      ctxGenerating = false;
+      setTimeout(() => { void ctxAutoMaybe(); }, 800);
+    });
+    st?.eventSource?.on?.(events.MESSAGE_RECEIVED, () => {
+      if (ui.currentTab === 'context') setTimeout(() => { void renderContext(); }, 400);
+    });
+    st?.eventSource?.on?.(events.CHAT_CHANGED, () => {
+      ctxSelected.clear();
+      ctxTokenMap.clear();
+      ctxGenerating = false;
+      setTimeout(() => {
+        void ctxReapply();
+        if (ui.currentTab === 'context') void renderContext();
+      }, 500);
+    });
+  } catch (err) {
+    console.warn('[API 管家] 上下文事件订阅失败', err);
+  }
+}
+
+/** 把零散的消息 id 合并成连续区间，减少 host 调用次数。 */
+function ctxGroupRanges(input) {
+  const ids = [...new Set(input)].sort((a, b) => a - b);
+  if (!ids.length) return [];
+  const ranges = [];
+  let start = ids[0];
+  let prev = ids[0];
+  for (const id of ids.slice(1)) {
+    if (id === prev + 1) {
+      prev = id;
+    } else {
+      ranges.push([start, prev]);
+      start = id;
+      prev = id;
+    }
+  }
+  ranges.push([start, prev]);
+  return ranges;
+}
+
+async function ctxChats() {
+  try {
+    if (!ctxChatsModulePromise) ctxChatsModulePromise = import('/scripts/chats.js');
+    return await ctxChatsModulePromise;
+  } catch (err) {
+    console.warn('[API 管家] 加载 chats.js 失败', err);
+    return null;
+  }
+}
+
+/** 把选中的消息按连续区间隐藏 / 取消隐藏。 */
+async function ctxHideSelected(hide) {
+  if (ctxBusy || ctxGenerating) {
+    toast('正在生成或压缩，稍后再试');
+    return;
+  }
+  const { chat } = await ctxResolveChat();
+  const ids = [...ctxSelected].filter((index) => index >= 0 && index < chat.length).sort((a, b) => a - b);
+  if (!ids.length) return;
+  const chats = await ctxChats();
+  if (!chats?.hideChatMessageRange) {
+    toast('宿主不支持隐藏消息');
+    return;
+  }
+  const ranges = ctxGroupRanges(ids);
+  for (const [from, to] of ranges) {
+    await chats.hideChatMessageRange(from, to, !hide);
+  }
+  ctxSelected.clear();
+  toast(`${hide ? '已隐藏' : '已取消隐藏'} ${ids.length} 条`);
+  if (ui.currentTab === 'context') void renderContext();
+}
+
+/** 删除选中的消息；删除前存一份快照，可从“恢复最近删除”找回。 */
+async function ctxDeleteSelected() {
+  if (ctxBusy || ctxGenerating) {
+    toast('正在生成或压缩，稍后再试');
+    return;
+  }
+  const { chat } = await ctxResolveChat();
+  const ids = [...ctxSelected]
+    .filter((index) => index > 0 && index < chat.length)
+    .sort((a, b) => b - a);
+  if (ctxSelected.has(0)) toast('首楼不能删除，只能隐藏');
+  if (!ids.length) return;
+  const confirmed = typeof globalThis.confirm === 'function'
+    ? globalThis.confirm(`删除 ${ids.length} 条消息？删除后可在「恢复最近删除」里找回。`)
+    : true;
+  if (!confirmed) return;
+  const st = await ctxST();
+  if (!st?.deleteMessage || !chat.length) {
+    toast('宿主不支持删除消息');
+    return;
+  }
+  const snapshot = ids
+    .map((index) => {
+      const message = chat[index];
+      if (!message) return null;
+      return {
+        index,
+        is_user: !!message.is_user,
+        is_system: !!message.is_system,
+        name: message.name,
+        send_date: message.send_date,
+        mes: String(message.mes ?? '').slice(0, 20000),
+      };
+    })
+    .filter(Boolean)
+    .slice(0, 200);
+  for (const index of ids) {
+    await st.deleteMessage(index);
+  }
+  const meta = ctxChatMetadata();
+  if (meta) {
+    const list = Array.isArray(meta.tamCtxDeleted) ? meta.tamCtxDeleted : [];
+    meta.tamCtxDeleted = [{ at: Date.now(), messages: snapshot }, ...list].slice(0, 3);
+  }
+  try {
+    await st.saveChatConditional?.();
+  } catch {
+    /* ignore */
+  }
+  ctxSelected.clear();
+  toast(ids.length > 200
+    ? `已删除 ${ids.length} 条（仅最近 200 条可恢复）`
+    : `已删除 ${ids.length} 条`);
+  if (ui.currentTab === 'context') void renderContext();
+}
+
+/** 把最近一次删除按原楼层插回去（id 位移后尽量靠近原位）。 */
+async function ctxRestoreDelete() {
+  const meta = ctxChatMetadata();
+  const list = Array.isArray(meta?.tamCtxDeleted) ? meta.tamCtxDeleted : [];
+  const snapshot = list[0];
+  if (!snapshot?.messages?.length) {
+    toast('没有可恢复的删除');
+    return;
+  }
+  const { chat } = await ctxResolveChat();
+  const st = await ctxST();
+  if (!chat.length || !st?.saveChatConditional) {
+    toast('宿主不支持恢复');
+    return;
+  }
+  for (const item of [...snapshot.messages].sort((a, b) => a.index - b.index)) {
+    chat.splice(Math.min(item.index, chat.length), 0, {
+      is_user: !!item.is_user,
+      is_system: !!item.is_system,
+      name: item.name,
+      mes: item.mes,
+      send_date: item.send_date,
+    });
+  }
+  await st.saveChatConditional();
+  if (meta) meta.tamCtxDeleted = list.slice(1);
+  toast(`已恢复 ${snapshot.messages.length} 条`);
+  if (ui.currentTab === 'context') void renderContext();
+}
+
+/* ---- 上下文 tab ---- */
+
+function ctxRow(message, tokens) {
+  const selected = ctxSelected.has(message.index);
+  return el('div', {
+    class: `tam-ctxrow${message.hidden ? ' tam-ctxrow-hidden' : ''}${selected ? ' is-sel' : ''}`,
+    dataset: { idx: String(message.index) },
+    onclick: () => {
+      if (ctxSelected.has(message.index)) ctxSelected.delete(message.index);
+      else ctxSelected.add(message.index);
+      ctxSyncSelection();
+    },
+  },
+    el('span', { class: `tam-ctxcb${selected ? ' is-on' : ''}` }),
+    el('span', { class: 'tam-ctxidx' }, `#${message.index}`),
+    el('span', { class: `tam-ctxwho${message.isUser ? ' is-user' : ''}` }, message.isUser ? '你' : message.name),
+    el('span', { class: 'tam-ctxtext' }, message.text.length > 160 ? `${message.text.slice(0, 160)}…` : message.text),
+    el('span', { class: 'tam-ctxtok' }, `${tokens}`),
+  );
+}
+
+/** 选中消息的 token 估算：列表内用精确值，列表外用估算补齐。 */
+function ctxSelectionTokens(ids) {
+  return ids.reduce((sum, id) => {
+    const known = ctxTokenMap.get(id);
+    return sum + (Number.isFinite(known) ? known : ctxEstimate(ctxTextMap.get(id) ?? ''));
+  }, 0);
+}
+
+/** 只改选中样式，不重新计数，避免点一下整页抖一下。 */
+function ctxSyncSelection() {
+  const rows = document.querySelectorAll('#tam-ctx-list .tam-ctxrow');
+  for (const row of rows) {
+    const index = Number(row.dataset.idx);
+    const on = ctxSelected.has(index);
+    row.classList.toggle('is-sel', on);
+    row.querySelector('.tam-ctxcb')?.classList.toggle('is-on', on);
+  }
+  const bar = $id('tam-ctx-selbar');
+  if (!bar) return;
+  const ids = [...ctxSelected];
+  const tokens = ctxSelectionTokens(ids);
+  bar.classList.toggle('tam-hidden', ids.length === 0);
+  const info = $id('tam-ctx-selinfo');
+  if (info) info.textContent = `已选 ${ids.length} 条 · ${tokens.toLocaleString()} tokens`;
+}
+
+/** 按楼层区间选中（从 #a 到 #b）。 */
+async function ctxRangeSelect() {
+  const fromRaw = $id('tam-ctx-from')?.value ?? '';
+  const toRaw = $id('tam-ctx-to')?.value ?? '';
+  if (String(fromRaw).trim() === '' || String(toRaw).trim() === '') {
+    toast('请先填写起止楼层');
+    return null;
+  }
+  const from = Number(fromRaw);
+  const to = Number(toRaw);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) {
+    toast('楼层必须是数字');
+    return null;
+  }
+  const { chat } = await ctxResolveChat();
+  const max = Math.max(0, chat.length - 1);
+  const start = Math.max(0, Math.min(Math.min(from, to), max));
+  const end = Math.max(0, Math.min(Math.max(from, to), max));
+  ctxSelected.clear();
+  for (let index = start; index <= end; index += 1) ctxSelected.add(index);
+  ctxSyncSelection();
+  return { start, end };
+}
+
+function ctxSelect(id, options, value, onChange) {
+  const select = el('select', { id, class: 'tam-ctxselect', onchange: onChange },
+    ...options.map(([optionValue, label]) => el('option', { value: String(optionValue) }, label)),
+  );
+  select.value = String(value);
+  return select;
+}
+
+let ctxRenderSeq = 0;
+
+async function renderContext() {
+  const body = ui.contextEl;
+  if (!body) return;
+  const seq = ++ctxRenderSeq;
+  const settings = ctxSettings();
+  const budget = ctxBudget();
+  const { chat, source } = await ctxResolveChat();
+  if (seq !== ctxRenderSeq) return;
+  const all = ctxMessages(chat);
+
+  if (!all.length) {
+    body.textContent = '';
+    body.append(el('p', { class: 'tam-hint' },
+      source === 'empty'
+        ? '没有读到聊天记录。先打开一个聊天窗口，再点这个 tab。'
+        : '当前没有聊天记录。先和角色说句话，再回来压缩。'));
+    return;
+  }
+
+  const visible = all.filter((message) => !message.hidden);
+  const hiddenCount = all.length - visible.length;
+  if (!visible.length) {
+    body.textContent = '';
+    body.append(
+      el('p', { class: 'tam-hint' }, '所有消息都被隐藏了。'),
+      el('div', { class: 'tam-ctxactions' },
+        el('button', {
+          class: 'tam-primary',
+          type: 'button',
+          onclick: () => { void ctxUnhideAll(); },
+        }, '全部取消隐藏'),
+      ),
+    );
+    return;
+  }
+
+  const total = await ctxCountTotal(visible);
+  if (seq !== ctxRenderSeq) return;
+
+  const ratio = budget.usable ? total.tokens / budget.usable : 0;
+  const pct = Math.max(0, Math.min(100, Math.round(ratio * 100)));
+  const state = pct >= 85 ? 'danger' : pct >= 60 ? 'warn' : 'ok';
+  const rows = visible.slice(-CTX_ROWS);
+  const each = await ctxCountEach(rows);
+  if (seq !== ctxRenderSeq) return;
+
+  ctxTokenMap.clear();
+  ctxTextMap.clear();
+  all.forEach((message) => ctxTextMap.set(message.index, message.text));
+  rows.forEach((message, index) => ctxTokenMap.set(message.index, each.counts[index] ?? 0));
+  body.textContent = '';
+
+  const meta = ctxChatMetadata()?.[CTX_META_KEY] ?? null;
+  const deleted = ctxChatMetadata()?.tamCtxDeleted ?? [];
+  const prefix = total.exact ? '' : '≈';
+  const selected = [...ctxSelected];
+
+  body.append(
+    el('div', { class: 'tam-ctxcard' },
+      el('div', { class: 'tam-ctxhead' },
+        el('div', {},
+          el('span', { class: 'tam-ctxlabel' }, '本次请求'),
+          el('div', { class: 'tam-ctxnum' }, `${prefix}${total.tokens.toLocaleString()}`,
+            el('small', {}, ` / ${budget.usable.toLocaleString()}`)),
+        ),
+        el('span', { class: 'tam-ctxpct', dataset: { state } }, `${pct}%`),
+      ),
+      el('div', { class: 'tam-ctxbar' },
+        el('i', { class: `is-${state}`, style: `width:${pct}%` }),
+      ),
+      el('div', { class: 'tam-ctxmeta' },
+        el('span', {}, `${all.length} 条 · ${hiddenCount} 条已隐藏 · ${source}`),
+        el('span', {}, budget.override > 0 ? `预算 ${budget.limit.toLocaleString()}（手动）` : `预算 ${budget.limit.toLocaleString()}`),
+      ),
+    ),
+  );
+
+  const avgTokens = total.tokens / Math.max(1, visible.length);
+  const keepNeed = (Number(settings.keepTurns) * 2 + 2) * avgTokens;
+  if (budget.usable < keepNeed) {
+    body.append(el('p', { class: 'tam-hint tam-hint-warn' },
+      `当前预算装不下「保留最近 ${settings.keepTurns} 轮」，建议把保留轮数调小，或把有效预算调大。`));
+  }
+
+  if (budget.rawLimit > budget.usable * 4) {
+    body.append(el('p', { class: 'tam-hint tam-hint-warn' },
+      `酒馆上下文设为 ${budget.rawLimit.toLocaleString()}，自动压缩几乎不会触发。建议把“有效预算”设成模型真实上限。`));
+  }
+
+  body.append(el('div', { class: 'tam-ctxsettings-toggle' },
+    el('button', {
+      class: 'tam-ctxlink',
+      type: 'button',
+      onclick: () => {
+        ctxSettingsOpen = !ctxSettingsOpen;
+        void renderContext();
+      },
+    }, ctxSettingsOpen ? '收起压缩设置' : '压缩设置（自动 / 保留轮数 / 预算）'),
+  ));
+
+  if (ctxSettingsOpen) body.append(
+    el('div', { class: 'tam-ctxcontrols' },
+      el('label', { class: 'tam-toggle tam-ctx-auto', for: 'tam-ctx-auto' },
+        (() => {
+          const input = el('input', { id: 'tam-ctx-auto', type: 'checkbox' });
+          input.checked = !!settings.auto;
+          input.addEventListener('change', () => {
+            saveCtxSettings({ auto: input.checked });
+            toast(input.checked ? '已开启自动压缩' : '已关闭自动压缩');
+          });
+          return input;
+        })(),
+        el('span', { class: 'tam-toggle-track', 'aria-hidden': 'true' }),
+        el('span', { class: 'tam-toggle-text' }, '自动压缩'),
+      ),
+      el('div', { class: 'tam-ctxfield' },
+        el('span', {}, '每聊'),
+        ctxSelect('tam-ctx-every', [[0, '不按轮数'], [5, '5 轮'], [10, '10 轮'], [15, '15 轮'], [20, '20 轮']], settings.autoEvery, (event) => {
+          saveCtxSettings({ autoEvery: Number(event.target.value) || 0 });
+        }),
+        el('span', {}, '自动压一次'),
+      ),
+      el('p', { class: 'tam-hint' },
+        `摘要会发送到当前激活连接：${ctxActiveConnection()?.name ?? '未选择'}；自动压缩同样会发送。`),
+      el('div', { class: 'tam-ctxseg' },
+        ...[['summary', '摘要压缩'], ['hide', '只隐藏']].map(([value, label]) =>
+          el('button', {
+            class: `tam-seg${settings.strategy === value ? ' is-on' : ''}`,
+            type: 'button',
+            onclick: () => {
+              saveCtxSettings({ strategy: value });
+              void renderContext();
+            },
+          }, label)),
+      ),
+      el('div', { class: 'tam-ctxfield' },
+        el('span', {}, '保留最近'),
+        ctxSelect('tam-ctx-keep', [[4, '4 轮'], [6, '6 轮'], [8, '8 轮'], [12, '12 轮']], settings.keepTurns, (event) => {
+          saveCtxSettings({ keepTurns: Number(event.target.value) || 6 });
+          void renderContext();
+        }),
+      ),
+      el('div', { class: 'tam-ctxfield' },
+        el('span', {}, '有效预算'),
+        ctxSelect('tam-ctx-budget', CTX_BUDGET_CHOICES, settings.budgetOverride, (event) => {
+          saveCtxSettings({ budgetOverride: Number(event.target.value) || 0 });
+          void renderContext();
+        }),
+      ),
+      el('p', { class: 'tam-hint' },
+        '参考：500 字 → 3 万；1000 字 → 5 万；2000 字 → 5–9 万；5000 字 → 11 万；1 万字 → 13–17 万；2 万字 → 30 万+（需模型支持）。'),
+    ),
+  );
+
+  body.append(
+    el('div', { class: 'tam-ctxactions' },
+      el('button', {
+        class: 'tam-primary',
+        type: 'button',
+        ...(ctxBusy || (settings.strategy !== 'hide' && !ctxActiveConnection()) ? { disabled: 'disabled' } : {}),
+        onclick: () => { void ctxCompress({ auto: false }); },
+      }, settings.strategy === 'hide' ? '隐藏旧消息' : '立即压缩'),
+      el('button', {
+        class: 'tam-ghost',
+        type: 'button',
+        ...(!meta ? { disabled: 'disabled' } : {}),
+        onclick: () => { void ctxUndo(); },
+      }, '撤销'),
+      el('button', {
+        class: 'tam-ghost',
+        type: 'button',
+        onclick: () => { void ctxUnhideAll(); },
+      }, '全部取消隐藏'),
+    ),
+  );
+
+  body.append(
+    el('div', { class: 'tam-ctxrange' },
+      el('span', { class: 'tam-ctxfield' }, '楼层'),
+      el('input', { id: 'tam-ctx-from', class: 'tam-ctxnum-input', type: 'number', min: '0', placeholder: '从' }),
+      el('span', { class: 'tam-ctxfield' }, '到'),
+      el('input', { id: 'tam-ctx-to', class: 'tam-ctxnum-input', type: 'number', min: '0', placeholder: '到' }),
+      el('button', {
+        class: 'tam-ghost',
+        type: 'button',
+        onclick: async () => { if (await ctxRangeSelect()) void ctxHideSelected(true); },
+      }, '隐藏'),
+      el('button', {
+        class: 'tam-ghost',
+        type: 'button',
+        onclick: async () => { if (await ctxRangeSelect()) void ctxHideSelected(false); },
+      }, '取消隐藏'),
+      el('button', {
+        class: 'tam-ghost is-danger',
+        type: 'button',
+        onclick: async () => { if (await ctxRangeSelect()) void ctxDeleteSelected(); },
+      }, '删除'),
+    ),
+  );
+
+  if (deleted.length) {
+    body.append(el('p', { class: 'tam-hint' },
+      el('button', {
+        class: 'tam-ctxlink',
+        type: 'button',
+        onclick: () => { void ctxRestoreDelete(); },
+      }, `恢复最近删除（${deleted[0].messages?.length ?? 0} 条）`)));
+  }
+
+  if (meta?.summary) {
+    body.append(
+      el('div', { class: 'tam-ctxsummary' },
+        el('div', { class: 'tam-ctxsummary-head' }, `已压缩 #${meta.start}–#${meta.end}`),
+        el('p', {}, meta.summary),
+      ),
+    );
+  }
+
+  body.append(el('div', {
+    class: `tam-ctxselbar${selected.length ? '' : ' tam-hidden'}`,
+    id: 'tam-ctx-selbar',
+  },
+    el('span', { class: 'tam-ctxselinfo', id: 'tam-ctx-selinfo' }, `已选 ${selected.length} 条 · ${ctxSelectionTokens(selected).toLocaleString()} tokens`),
+    el('button', { class: 'tam-ghost', type: 'button', onclick: () => { ctxSelected.clear(); ctxSyncSelection(); } }, '清除'),
+    el('button', { class: 'tam-ghost', type: 'button', onclick: () => { void ctxHideSelected(true); } }, '隐藏'),
+    el('button', { class: 'tam-ghost', type: 'button', onclick: () => { void ctxHideSelected(false); } }, '取消隐藏'),
+    el('button', { class: 'tam-ghost is-danger', type: 'button', onclick: () => { void ctxDeleteSelected(); } }, '删除'),
+  ));
+
+  body.append(el('div', { class: 'tam-ctxlisthead' }, el('span', {}, `最近 ${rows.length} 条`), el('span', {}, total.exact ? '精确' : '估算')));
+  body.append(el('div', { class: 'tam-ctxlist', id: 'tam-ctx-list' },
+    ...rows.map((message, index) => ctxRow(message, each.counts[index] ?? 0)),
+  ));
+  body.append(el('p', { class: 'tam-hint' },
+    '只改动聊天消息；角色卡、预设、世界书都不会被修改。勾选或输入楼层区间后可直接隐藏 / 删除。'));
+}
+
+/** 给测试用的纯函数出口。 */
+if (typeof globalThis === 'object') {
+  globalThis.__TAM_CTX__ = { ctxEstimate, ctxSummaryPrompt, ctxPlan, ctxBudget, ctxCountTotal, ctxGroupRanges, ctxAutoDecision, ctxBatchMessages, getSelected: () => [...ctxSelected] };
 }
 
 const FORMAT_CANDIDATES = [
@@ -2623,9 +3826,19 @@ ui.submitForm = async () => {
 };
 
 async function onActivate(connection) {
-  const result = await store.activate(connection);
-  toast(result.applied ? '已切换当前 API' : result.reason ?? '已记录为当前选择');
-  await renderConnections();
+  const result = await store.activate(connection, { test: true });
+  if (!result.applied) {
+    toast(result.reason ?? '已记录为当前选择');
+  } else if (result.test) {
+    toast(
+      result.test.ok
+        ? `已切换并测试通过：${result.test.message}`
+        : `已切换，但连接测试失败：${result.test.message}`,
+    );
+  } else {
+    toast('已切换当前 API');
+  }
+  if (result.applied) ui.setActiveRow(connection.id);
 }
 
 async function onDelete(connection) {
@@ -2694,6 +3907,7 @@ async function boot() {
   installFetchFailover();
   ui.setTab('connections');
   await renderConnections();
+  void ctxInstallHooks();
 
   host.waitReady().then((tt) => {
     if (tt?.api) isHostReady = true;
@@ -2716,6 +3930,7 @@ async function boot() {
     render: renderConnections,
     failover: maybeFailover,
     probe: probeCustomApiFormats,
+    context: { render: renderContext, compress: ctxCompress, undo: ctxUndo, measure: ctxCountTotal },
   };
 }
 
@@ -2724,3 +3939,23 @@ if (document.readyState === 'loading') {
 } else {
   void boot();
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

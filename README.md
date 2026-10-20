@@ -1,156 +1,114 @@
-
-》》这是纯吐槽
-  -起因就是我个人觉得酒馆调用api一天四五块钱有点花钱就想免费游玩。尝试的办法有手机用Termux部署ollama的千问3b。然后后面了解到有签到额度的模型所以就想整个管理工具切换api，就用dsh写了一下。
-  -所以后面大概率就不会去更新版本了。
-  -有实力的兄弟们可以自己更改。
-  -这个README也是deepseek写的。
-  -
-  ---如果这个插件有bug也可以告诉我。说不定我就改了
-  
-   里面的json直接导入就可以了！！！在提一嘴我是用dsh跑的这个软件TauriTavern2.3的版本。
-
- 然后最后就是生成这个插件实在高峰时段。所以求求兄弟们赏给我一块钱回一下血。
-如果不愿意的话兄弟们拿走用就行了。
-<img width="1341" height="1827" alt="感谢兄弟们" src="https://github.com/user-attachments/assets/2c0c0111-c2ea-4174-826f-d5d9002f32f2" />
-
-如果兄弟们使用我的源码修改出来比我这个好的插件也可以放在评论区让我品尝一下。
 # API 悬浮管家
 
-> TauriTavern / SillyTavern 的 API 连接管理悬浮窗
-> 当前版本：**0.6.7** · 适用于 TauriTavern 2.3.0（SillyTavern 1.18 前端）
+TauriTavern / SillyTavern 的常驻悬浮面板：多 API 一键切换、用量统计、上下文压缩。
 
-一个常驻在聊天界面右下角的悬浮窗，用来管理多套 API（官方 / 中转站）、一键切换酒馆当前使用的 API，并查看本机用量。
+> 当前版本：**0.7.5** · 适用于 TauriTavern 2.3.0（SillyTavern 1.18 前端）
+> 支持 Windows 客户端、Android 客户端，以及普通 SillyTavern 网页版（本地模式）。
 
-> **0.6.7 修复**：新 Key 写入后显式激活为当前项，避免切换后仍拿旧 Key 请求新地址；切换/保存不再自动点「连接」，避免失败时弹红色报错。
-
-![手机端](screenshots/mobile.png)
+![上下文面板](screenshots/context.png)
 
 ## 功能
 
-- **多 API 档案**：名称、Base URL、提供商、模型、Key 分开保存，随时切换。
-- **读取酒馆配置**：一键把当前酒馆的 API 配置存成档案。
-- **已保存密钥下拉**：直接复用酒馆 `api_key_*` 槽位里的 Key，不必重复粘贴。
-- **一键切换**：写回酒馆的 `chat_completion_source` / `custom_url` / 模型，并触发「连接」。
-- **本机用量**：记录今日请求数、输入 Tokens、输出 Tokens，只保留最近 31 天。
-- **自动故障切换**：401/429 时按列表顺序切到下一条宿主连接；默认不自动重发，避免重复消息。
-- **导入 / 导出**：导出默认脱敏，只有你确认时才包含明文 Key。
-- **安全兜底**：宿主设置中不保存明文 Key；陌生地址使用前会二次确认；拒绝非 http(s) 地址。
+- **多 API 管理**：Base URL / Key / 模型 / 提供商；一键切换，测试通过后自动恢复酒馆连接状态（插头变绿）。
+- **用量统计**：本机请求数、输入/输出 tokens，按天归档。
+- **诊断**：宿主 ABI、酒馆设置、DOM、端点格式探测，一键复制。
+- **上下文管家**：
+  - 实时显示本次请求的 token 占用量与预算占比；
+  - 逐条消息 tokens，支持勾选或「从 # 到 #」楼层区间；
+  - 隐藏 / 取消隐藏 / 删除（可恢复）；
+  - 摘要压缩或只隐藏；自动压缩支持「每 N 轮」与比例阈值；
+  - 角色卡、预设、世界书全程只读。
 
 ## 目录结构
 
 ```
-api-floating-manager/
-├─ README.md                     # 本文件
-├─ 使用说明.md                    # 面向使用者的完整说明
-├─ API悬浮管家.script.json        # 手机端「酒馆助手」直接导入的脚本
-├─ pc/                           # 电脑端扩展源码
+.
+├─ API悬浮管家.script.json      # 手机端：酒馆助手导入
+├─ 使用说明.md                  # 完整安装 / 使用 / 排错
+├─ README.md
+├─ LICENSE .md
+├─ 感谢兄弟们.png               # 支持作者
+├─ pc/                          # 电脑端扩展
 │  ├─ index.js
 │  ├─ style.css
 │  ├─ manifest.json
 │  └─ install.ps1
-├─ mobile/                       # 手机端源码与构建脚本
-│  ├─ README.md                  # 移动端构建说明
-│  ├─ mobile.js                  # 移动端运行时补丁（软键盘避让）
-│  ├─ build-mobile.ps1           # 从 pc/ 生成 mobile/dist/tauri-api-manager-mobile
-│  ├─ build-script-json.ps1      # 从 pc/ 生成根目录的 .script.json
-│  └─ dist/
-│     └─ tauri-api-manager-mobile/   # 可直接作为扩展安装的移动版目录
-└─ screenshots/                  # README 用截图
+├─ mobile/                      # 手机端源码与构建脚本
+│  ├─ mobile.js
+│  ├─ build-mobile.ps1
+│  ├─ build-script-json.ps1
+│  ├─ README.md
+│  └─ dist/tauri-api-manager-mobile/
+└─ screenshots/
 ```
 
 ## 快速开始
 
-### 电脑版（TauriTavern 客户端）
+### 电脑版
 
 ```powershell
 cd pc
 pwsh -File .\install.ps1
 ```
 
-脚本会复制到：
+默认安装到：
 
 ```
 %APPDATA%\com.tauritavern.client\data\extensions\third-party\tauri-api-manager
 ```
 
-然后重启 TauriTavern，或刷新页面。右下角出现悬浮球即可。
+装完重启 TauriTavern 或刷新页面，右下角出现圆形悬浮球。
 
-如需安装到其它数据目录：
+### 手机版（推荐）
 
-```powershell
-pwsh -File .\install.ps1 -DataDir "D:\somewhere\com.tauritavern.client\data"
-```
+酒馆助手 → 脚本库 → 全局 → 导入 → 选择 `API悬浮管家.script.json` → 打开脚本开关。
 
-### 手机版（推荐：酒馆助手脚本）
+### 普通 SillyTavern
 
-1. 把根目录的 `API悬浮管家.script.json` 传到手机；
-2. 打开酒馆助手（JS-Slash-Runner）→ 脚本库 → 全局；
-3. 导入该 JSON，打开脚本开关；
-4. 刷新酒馆页面，右下角出现悬浮球。
+把 `pc/` 里的 `index.js`、`style.css`、`manifest.json` 放进
+`data/<user>/extensions/tauri-api-manager/`，刷新页面。
 
-> 如果酒馆助手开启了「使用 blob iframe」，扩展会因跨域无法注入，请关闭该选项。
+## 上下文预算怎么选
 
-### 手机版（扩展目录）
+实测（羽毛笔 + 猎人游戏，前缀 5,505）：
 
-`mobile/dist/tauri-api-manager-mobile/` 是一个标准扩展目录（`manifest.json` 在根）。可以：
+| 单条回复 | 最低档 | 舒适档 |
+|---|---:|---:|
+| 500 字 | 3 万 | 5 万 |
+| 1000 字 | 5 万 | 9 万 |
+| 2000 字 | 5 万（21 轮） | 9 万（41 轮） |
+| 5000 字 | 11 万 | 17 万（需模型支持） |
+| 1 万字 | 13 万 | 17 万（需模型支持） |
 
-- 把它单独推到 GitHub，在 App 的「安装扩展」里填仓库 URL；
-- 或按 `pc/install.ps1` 的方式复制到扩展目录验证。
+- 预设把上下文写成 `2,000,000` 时，自动压缩几乎不会触发；先在「上下文 → 压缩设置 → 有效预算」里选一个真实档位。
+- 长聊天建议「每 10 轮」自动压一次，保留最近 6 轮；2000 字以上回复建议保留 4 轮。
+- 超过模型真实上下文的档位（如 DeepSeek 128k 选 30 万）只会在请求时被模型截断，不要选。
 
-## 从源码重新构建
-
-需要 PowerShell 5.1+。
+## 构建
 
 ```powershell
 cd mobile
-
-# 1. 生成移动版扩展目录
-pwsh -File .\build-mobile.ps1
-
-# 2. 生成酒馆助手脚本 JSON（输出到仓库根目录）
-pwsh -File .\build-script-json.ps1
+pwsh -File .\build-mobile.ps1      # 扩展目录
+pwsh -File .\build-script-json.ps1 # 酒馆助手 JSON（输出到仓库根目录）
 ```
 
-构建逻辑：
+## 支持作者
 
-- `mobile/build-mobile.ps1`：把 `pc/` 的 `index.js` + `mobile.js` 合并，复制 `style.css`，改写 manifest 显示名；
-- `mobile/build-script-json.ps1`：把同样的代码和样式包装成酒馆助手 Script JSON。
+如果这个插件帮到你，可以请作者喝瓶水：
 
-## 上传到 GitHub
+![感谢兄弟们](感谢兄弟们.png)
 
-```powershell
-cd api-floating-manager
-git init
-git add .
-git commit -m "feat: API 悬浮管家 0.6.7"
-git branch -M main
-git remote add origin https://github.com/<你的账号>/<仓库名>.git
-git push -u origin main
-```
+## 许可
 
-仓库根目录已经有 `README.md`、`使用说明.md` 和可直接导入的 JSON，GitHub 页面可以直接展示。
+见 [LICENSE .md](LICENSE%20.md)。
 
-## 文档
+## 更新记录
 
-完整安装、界面、切换、密钥、用量、故障排查见 [使用说明.md](使用说明.md)。
+- **0.7.5**：超长消息截断保护、预算装不下保留轮数时警告、设置内附档位参考。
+- **0.7.4**：有效预算档位改为 1 万–20 万。
+- **0.7.3**：长聊天摘要分批（单次 4 万字符）。
+- **0.7.2**：并发压缩串行化、越界楼层裁剪、首楼保护、生成中禁止改动。
+- **0.7.1**：修复上下文 tab 抖动与「没有聊天记录」误报、楼层区间、按轮数自动压缩。
+- **0.7.0**：新增上下文管家。
 
-## 安全说明
-
-1. 填了新 Key 时优先写宿主机密存储 `/api/secrets/write`；成功后本地缓存只保留 `secretRef`。
-2. 宿主设置（会进 `settings.json`）只写脱敏副本，不保存明文 Key。
-3. `localStorage` 仅在宿主机密路由不可用时作为兜底；旧版本遗留的明文 Key 会在下次保存/使用时清掉。
-4. 导出文件只有你选「确定」时才包含明文 Key，请勿提交到仓库或发到群里。
-5. 扩展本身不会向第三方域名发请求；请求只会发往你填写的 Base URL 或酒馆自身的 `/api/*`。
-
-## 兼容性
-
-- TauriTavern 2.3.0（SillyTavern 1.18 前端），Windows / Android。
-- 普通 SillyTavern 网页版可使用「本地模式」，但读不到 Tauri 的 LLM 连接与 Agent Profile。
-- 首次切换自定义端点时，宿主会弹「允许连接到自定义端点？」，点一次「信任并连接」即可。
-
-## 已知限制
-
-- 用量依赖服务商返回 `usage`；流式响应在结束时读取，不返回时只计请求数。
-- 本地用量只保留 31 天，清空统计不影响宿主日志。
-- 自动故障切换不会自动重发上一条消息，需要手动点发送。
-- 手机端 UI 若被其它主题用 `* { border-radius: 0 !important }` 强制方角，0.6.5+ 已做圆角防御。
+完整说明见 [使用说明.md](使用说明.md)。

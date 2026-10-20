@@ -1054,6 +1054,368 @@
 }
 
 /* ---------------------------------------------------------------- *
+ * 上下文管家
+ * ---------------------------------------------------------------- */
+
+#tam-panel.tam-ctx-tall {
+  height: min(80vh, 700px);
+  max-height: none;
+}
+
+#tam-root .tam-ctxcard {
+  border: 1px solid var(--tam-border);
+  background: var(--tam-surface);
+  padding: 12px 13px;
+}
+
+#tam-root .tam-ctxhead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+#tam-root .tam-ctxlabel {
+  font-size: 11px;
+  color: var(--tam-fg-muted);
+  letter-spacing: 0.3px;
+}
+
+#tam-root .tam-ctxnum {
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  line-height: 1.2;
+  margin-top: 2px;
+}
+
+#tam-root .tam-ctxnum small {
+  font-size: 11px;
+  color: var(--tam-fg-dim);
+  font-weight: 400;
+  margin-left: 3px;
+}
+
+#tam-root .tam-ctxpct {
+  flex: none;
+  font-size: 12px;
+  padding: 3px 8px;
+  color: #7ee2b8;
+  background: rgba(52, 211, 153, 0.1);
+  border: 1px solid rgba(52, 211, 153, 0.28);
+}
+
+#tam-root .tam-ctxpct[data-state="warn"] {
+  color: #ffd479;
+  background: rgba(251, 191, 36, 0.1);
+  border-color: rgba(251, 191, 36, 0.3);
+}
+
+#tam-root .tam-ctxpct[data-state="danger"] {
+  color: #ffb4b4;
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
+#tam-root .tam-ctxbar {
+  height: 7px;
+  margin: 10px 0 7px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+#tam-root .tam-ctxbar i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+#tam-root .tam-ctxbar i.is-ok {
+  background: linear-gradient(90deg, #3f47a8, #8b93ff);
+}
+
+#tam-root .tam-ctxbar i.is-warn {
+  background: linear-gradient(90deg, #a86b2c, #e8b06a);
+}
+
+#tam-root .tam-ctxbar i.is-danger {
+  background: linear-gradient(90deg, #a83c3c, #f87171);
+}
+
+#tam-root .tam-ctxmeta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--tam-fg-dim);
+}
+
+#tam-root .tam-hint-warn {
+  color: #ffd479;
+  background: rgba(251, 191, 36, 0.08);
+  border: 1px solid rgba(251, 191, 36, 0.22);
+  padding: 8px 9px;
+}
+
+#tam-root .tam-ctxcontrols {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 12px 0 10px;
+}
+
+#tam-root .tam-ctx-auto {
+  flex: 1 0 100%;
+}
+
+#tam-root .tam-ctxfield {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--tam-fg-muted);
+}
+
+#tam-root .tam-ctxselect {
+  background: var(--tam-surface);
+  border: 1px solid var(--tam-border);
+  color: var(--tam-fg);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 5px 7px;
+}
+
+#tam-root .tam-ctxactions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+#tam-root .tam-ctxactions {
+  flex-wrap: wrap;
+}
+
+#tam-root .tam-ctxactions button {
+  flex: 1 1 30%;
+  height: 34px;
+  justify-content: center;
+  padding: 0 6px;
+}
+
+#tam-root .tam-ctxrange {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 8px 9px;
+  border: 1px solid var(--tam-border);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+#tam-root .tam-ctxnum-input {
+  width: 58px;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--tam-border);
+  background: var(--tam-surface);
+  color: var(--tam-fg);
+  font: inherit;
+  font-size: 11.5px;
+}
+
+#tam-root .tam-ctxrange button {
+  height: 28px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+#tam-root .tam-ctxsummary {
+  border: 1px solid var(--tam-border);
+  background: rgba(94, 106, 210, 0.1);
+  padding: 9px 11px;
+  margin-bottom: 12px;
+}
+
+#tam-root .tam-ctxsummary-head {
+  font-size: 10.5px;
+  color: var(--tam-accent-2);
+  margin-bottom: 4px;
+}
+
+#tam-root .tam-ctxsummary p {
+  margin: 0;
+  font-size: 11.5px;
+  color: #c3c7d2;
+  line-height: 1.6;
+  max-height: 96px;
+  overflow: auto;
+}
+
+#tam-root .tam-ctxlisthead {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10.5px;
+  color: var(--tam-fg-dim);
+  margin: 0 2px 4px;
+}
+
+#tam-root .tam-ctxrow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 10px;
+}
+
+#tam-root .tam-ctxrow:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+#tam-root .tam-ctxrow-hidden {
+  opacity: 0.45;
+}
+
+#tam-root .tam-ctxidx {
+  width: 30px;
+  flex: none;
+  font-size: 10px;
+  color: var(--tam-fg-dim);
+}
+
+#tam-root .tam-ctxwho {
+  width: 46px;
+  flex: none;
+  font-size: 10.5px;
+  color: #9aa0ad;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#tam-root .tam-ctxwho.is-user {
+  color: #9fb0ff;
+}
+
+#tam-root .tam-ctxtext {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: #cfd2da;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#tam-root .tam-ctxtok {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--tam-fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+#tam-root .tam-ctxrow {
+  cursor: pointer;
+}
+
+#tam-root .tam-ctxrow.is-sel {
+  background: rgba(94, 106, 210, 0.14);
+}
+
+#tam-root .tam-ctxcb {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  margin-top: 2px;
+  border: 1.5px solid rgba(255, 255, 255, 0.22);
+  border-radius: 5px;
+  position: relative;
+}
+
+#tam-root .tam-ctxcb.is-on {
+  background: var(--tam-accent);
+  border-color: var(--tam-accent-2);
+}
+
+#tam-root .tam-ctxcb.is-on::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 1px;
+  width: 4px;
+  height: 8px;
+  border: 1.6px solid #fff;
+  border-top: 0;
+  border-left: 0;
+  transform: rotate(42deg);
+}
+
+#tam-root .tam-ctxseg {
+  display: flex;
+  flex: 1 0 100%;
+  gap: 4px;
+  padding: 3px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--tam-border);
+}
+
+#tam-root .tam-seg {
+  flex: 1;
+  height: 26px;
+  border: 0;
+  background: transparent;
+  color: var(--tam-fg-muted);
+  font: inherit;
+  font-size: 11.5px;
+}
+
+#tam-root .tam-seg.is-on {
+  background: var(--tam-surface-strong);
+  color: var(--tam-fg);
+  font-weight: 600;
+}
+
+#tam-root .tam-ctxselbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  padding: 8px 9px;
+  border: 1px solid rgba(139, 147, 255, 0.28);
+  background: rgba(94, 106, 210, 0.12);
+}
+
+#tam-root .tam-ctxselinfo {
+  flex: 1 1 auto;
+  font-size: 10.5px;
+  color: var(--tam-fg-muted);
+  white-space: nowrap;
+}
+
+#tam-root .tam-ctxselbar button {
+  height: 26px;
+  padding: 0 6px;
+  font-size: 10.5px;
+}
+
+#tam-root .tam-ctxlink {
+  border: 0;
+  background: transparent;
+  color: var(--tam-accent-2);
+  font: inherit;
+  font-size: 11px;
+  padding: 0;
+}
+
+#tam-root .tam-ghost.is-danger {
+  color: #ffb4b4;
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
+/* ---------------------------------------------------------------- *
  * 防御性圆角：部分酒馆主题/扩展会用
  *   * { border-radius: 0 !important }
  * 把页面所有圆角抹平（伪元素不受影响，所以会出现“方按钮 + 圆旋钮”）。
@@ -1078,7 +1440,17 @@
 #tam-root .tam-toggle-track,
 #tam-root .tam-chip,
 #tam-root .tam-badge,
+#tam-root .tam-ctxbar,
+#tam-root .tam-ctxpct,
 #tam-toast {
   border-radius: 999px !important;
 }
+
+#tam-root .tam-ctxcb {
+  border-radius: 5px !important;
+}
+
+
+
+
 
