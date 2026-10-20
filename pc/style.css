@@ -589,9 +589,9 @@
   color: var(--tam-fg-muted);
   font-size: 11px;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.55;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .tam-footer-btn {
@@ -1059,7 +1059,16 @@
 
 #tam-panel.tam-ctx-tall {
   height: min(80vh, 700px);
+  height: min(80vh, calc(100dvh - 170px));
   max-height: none;
+}
+
+#tam-root #tam-context {
+  padding-bottom: 12px;
+}
+
+#tam-panel.tam-ctx-tall.tam-collapsed {
+  height: auto;
 }
 
 #tam-root .tam-ctxcard {
@@ -1415,6 +1424,95 @@
   border-color: rgba(248, 113, 113, 0.3);
 }
 
+
+/* ---------- 压缩预览 ---------- */
+
+#tam-ctx-preview {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(3, 4, 8, 0.62);
+  backdrop-filter: blur(2px);
+  pointer-events: auto;
+}
+
+#tam-ctx-preview-card {
+  width: min(420px, 100%);
+  max-height: min(76vh, 560px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--tam-border);
+  border-radius: 20px;
+  background: linear-gradient(180deg, #141727, #0b0d15);
+  box-shadow: var(--tam-shadow);
+}
+
+#tam-ctx-preview-card h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+#tam-ctx-preview-text {
+  width: 100%;
+  min-height: 140px;
+  flex: 1;
+  resize: vertical;
+  padding: 9px 10px;
+  border: 1px solid var(--tam-border);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--tam-fg);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+#tam-ctx-preview-text:focus {
+  outline: none;
+  border-color: rgba(139, 147, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(94, 106, 210, 0.22);
+}
+
+#tam-ctx-preview-est {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  border-radius: 10px;
+  background: rgba(52, 211, 153, 0.09);
+  color: #9ee9c9;
+  font-size: 11.5px;
+}
+
+#tam-ctx-preview-card .tam-ctxactions {
+  margin: 0;
+}
+
+#tam-root .tam-ctxsettings-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--tam-border);
+  border-radius: 999px;
+  background: var(--tam-surface);
+  color: var(--tam-accent-2);
+  font: inherit;
+  font-size: 11px;
+}
+
+#tam-root .tam-ctxsettings-toggle button:hover {
+  background: var(--tam-surface-strong);
+}
+
 /* ---------------------------------------------------------------- *
  * 防御性圆角：部分酒馆主题/扩展会用
  *   * { border-radius: 0 !important }
@@ -1449,6 +1547,7 @@
 #tam-root .tam-ctxcb {
   border-radius: 5px !important;
 }
+
 
 
 

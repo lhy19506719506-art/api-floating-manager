@@ -18,7 +18,7 @@
  */
 
 const MODULE_ID = 'tauri-api-manager';
-const VERSION = '0.7.5';
+const VERSION = '0.7.13';
 
 /* ------------------------------------------------------------------ *
  * 1. 工具
@@ -68,6 +68,8 @@ const DEFAULT_SETTINGS = {
   panel: { x: null, y: null, collapsed: false, open: false },
   fab: { x: null, y: null },
   autoFailover: true,
+  // null = 自动：有宿主 secrets 时不把明文 Key 写进 localStorage
+  storeKeys: null,
   // 本机用量：{ days: { 'YYYY-MM-DD': { requests, prompt, completion, updatedAt } } }
   usage: { days: {} },
   // 上下文管家：只动聊天历史，不碰角色卡 / 预设 / 世界书
@@ -77,6 +79,7 @@ const DEFAULT_SETTINGS = {
     keepTurns: 6,
     strategy: 'summary',
     autoEvery: 0,
+    confirmSend: true,
     budgetOverride: 0,
     summaryChars: 240,
   },
@@ -106,6 +109,12 @@ function hostGateActive() {
 let settingsCache = null;  // 单例：保证「取出来 → 改 → 存」这一串能落到同一份数据
 
 /** 宿主设置里永远不保存明文 Key：写入前统一抹掉。 */
+/** 是否把明文 Key 写进 localStorage。默认：有宿主 secrets 就不写。 */
+function effectiveStoreKeys(settings = loadSettings()) {
+  if (typeof settings.storeKeys === 'boolean') return settings.storeKeys;
+  return !host.api();
+}
+
 function redactSettings(data) {
   const copy = clone(data);
   if (Array.isArray(copy.items)) {
@@ -199,7 +208,11 @@ function saveSettings() {
     try {
       // 双写：localStorage 保证扩展自己的状态一定留得住，
       // extension_settings 让宿主的设置面板也能看到（但绝不写入明文 Key）。
-      localStorage.setItem(MODULE_ID, JSON.stringify(data));
+      const mirror = clone(data);
+      if (!effectiveStoreKeys(data)) {
+        mirror.items = (mirror.items ?? []).map((item) => ({ ...item, key: '' }));
+      }
+      localStorage.setItem(MODULE_ID, JSON.stringify(mirror));
     } catch (err) {
       console.warn('[API 管家] 写入 localStorage 失败', err);
     }
@@ -494,9 +507,9 @@ const secrets = {
         console.warn('[API 管家] /api/secrets/write 返回', res.status);
         return null;
       }
-      await refreshSTSecretState();
       const data = await res.json().catch(() => ({}));
       let id = data?.id ?? data?.secret?.id ?? data?.data?.id ?? null;
+      await refreshSTSecretState();
 
       if (!id) {
         const readRes = await fetch('/api/secrets/read', {
@@ -1481,6 +1494,8 @@ async function inspectChatResponse(response) {
 function installFetchFailover() {
   const original = globalThis.fetch;
   if (typeof original !== 'function' || original.__tamFailover) return;
+  // 扩展自己的摘要请求不能走这个 hook，否则会被计入用量/触发故障切换
+  globalThis.__TAM_RAW_FETCH__ = original;
 
   const wrapped = async function (...args) {
     const response = await original.apply(this, args);
@@ -1879,6 +1894,16 @@ function buildUi() {
   root.append(modal);
   document.body.append(root);
 
+  root.addEventListener('focusin', (event) => {
+    const target = event.target;
+    if (target && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) {
+      setTimeout(() => target.scrollIntoView?.({ block: 'center', behavior: 'smooth' }), 120);
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') ctxClosePreview();
+  });
+
   // 必须等 modal 挂到 document 之后再用 getElementById 绑，否则 $id 返回 null
   for (const id of ['tam-f-url', 'tam-f-provider']) {
     $id(id)?.addEventListener('change', () => {
@@ -2214,6 +2239,27 @@ function usageAutoFailoverToggle() {
   );
 }
 
+function usageStoreKeysToggle() {
+  const input = el('input', { id: 'tam-store-keys', type: 'checkbox' });
+  input.checked = effectiveStoreKeys();
+  input.addEventListener('change', () => {
+    const settings = loadSettings();
+    settings.storeKeys = input.checked;
+    saveSettings();
+    toast(input.checked ? '已允许本地镜像保存 Key' : '已停止写入明文 Key');
+    if (!input.checked) {
+      // 立刻清掉镜像里已经写过的明文
+      setTimeout(() => saveSettings(), 260);
+    }
+  });
+
+  return el('label', { class: 'tam-toggle', for: 'tam-store-keys' },
+    input,
+    el('span', { class: 'tam-toggle-track', 'aria-hidden': 'true' }),
+    el('span', { class: 'tam-toggle-text' }, '本地镜像保存 Key（关闭更安全）'),
+  );
+}
+
 function renderUsage() {
   const body = ui.usageEl;
   if (!body) return;
@@ -2228,6 +2274,7 @@ function renderUsage() {
       usageStat('输出 Tokens', day.completion),
     ),
     usageAutoFailoverToggle(),
+    usageStoreKeysToggle(),
     el('div', { class: 'tam-usage-actions' },
       el('button', {
         id: 'tam-clear-usage',
@@ -2331,6 +2378,8 @@ const CTX_BUDGET_CHOICES = [
   [200000, '20 万'],
   [300000, '30 万'],
   [500000, '50 万'],
+  [1000000, '100 万'],
+  [2000000, '200 万'],
 ];
 
 let ctxBusy = false;
@@ -2341,6 +2390,59 @@ const ctxSelected = new Set();
 const ctxTokenMap = new Map();
 const ctxTextMap = new Map();
 let ctxChatsModulePromise = null;
+
+/** 根据当前前缀和最近回复长度，推荐一个能撑 24 轮的预算档位。 */
+/** 用宿主批量接口算整段历史的精确 tokens；旧宿主退回估算。 */
+async function ctxCountAll(messages) {
+  const payload = ctxPayload(messages);
+  let total = 0;
+  for (let i = 0; i < payload.length; i += 100) {
+    const chunk = payload.slice(i, i + 100);
+    let counted = null;
+    try {
+      const res = await fetch(`/api/tokenizers/openai/count-batch?model=${encodeURIComponent(ctxModel())}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(chunk),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        if (Array.isArray(data?.token_counts) && data.token_counts.length === chunk.length
+          && data.token_counts.every(Number.isFinite)) {
+          counted = data.token_counts.reduce((sum, value) => sum + value, 0);
+        }
+      }
+    } catch {
+      /* fallthrough */
+    }
+    total += counted ?? chunk.reduce((sum, item) => sum + ctxEstimate(item.content) + 4, 0);
+  }
+  return total;
+}
+
+async function ctxRecommendBudget(visible, totalTokens) {
+  if (!Array.isArray(visible) || visible.length < 4) return null;
+  const history = await ctxCountAll(visible);
+  const prefix = Math.max(0, totalTokens - history);
+  const assistants = visible.filter((message) => !message.isUser).slice(-3);
+  if (assistants.length < 2) return null;
+  const avg = assistants.reduce((sum, message) => sum + ctxEstimate(message.text) + 4, 0) / assistants.length;
+  const perTurn = avg * 2;
+  const need = Math.ceil((prefix + 24 * perTurn + 400) / 0.65);
+  const tiers = CTX_BUDGET_CHOICES.map(([value]) => value).filter((value) => value > 0);
+  const pick = tiers.find((value) => value >= need) ?? tiers[tiers.length - 1];
+  return { prefix, perTurn, need, pick };
+}
+
+/** 旧版本存过 32k/64k/128k/256k 时，补一个「自定义」选项，避免下拉空白。 */
+function ctxBudgetOptions(current) {
+  const options = CTX_BUDGET_CHOICES.slice();
+  const value = Number(current) || 0;
+  if (value > 0 && !options.some(([optionValue]) => optionValue === value)) {
+    options.push([value, `${Math.round(value / 10000)} 万（自定义）`]);
+  }
+  return options;
+}
 
 function ctxSettings() {
   const stored = loadSettings().context;
@@ -2500,7 +2602,8 @@ async function ctxConnectionKey(connection) {
   if (connection?.key) return connection.key;
   try {
     const list = await secrets.list(`api_key_${sourceOf(connection)}`);
-    const hit = list.find((secret) => secret.id === connection?.secretId)
+    const wanted = connection?.secretRef?.id ?? connection?.secretId;
+    const hit = list.find((secret) => secret.id === wanted)
       ?? list.find((secret) => secret.active)
       ?? list[0];
     return hit?.value ?? '';
@@ -2509,9 +2612,9 @@ async function ctxConnectionKey(connection) {
   }
 }
 
-function ctxSummaryPrompt(transcript, chars) {
+function ctxSummaryPrompt(transcript, chars, previous = '') {
   const max = Math.max(120, Number(chars) || 240);
-  return [
+  const lines = [
     '你是剧情压缩器。把下面这段角色扮演对话压成一条「前情提要」。',
     '',
     '保留：',
@@ -2522,10 +2625,18 @@ function ctxSummaryPrompt(transcript, chars) {
     '',
     '不要编造，不要评价，不要用第一人称。',
     `输出 ${Math.max(120, max - 60)}–${max} 字的中文段落，不要分点，不要标题。`,
-    '',
-    '对话：',
-    transcript,
-  ].join('\n');
+  ];
+  if (previous) {
+    lines.push(
+      '',
+      '这是之前已经压缩好的前情提要（更早的剧情）：',
+      previous,
+      '',
+      '请把「旧提要」和下面的「新增对话」合并成一条新的前情提要：保留旧提要里仍然有效的设定、关系与未兑现的约定，补上新增事件，删掉重复表述。',
+    );
+  }
+  lines.push('', '对话：', transcript);
+  return lines.join('\n');
 }
 
 /** 优先走 getContext，拿不到再退回 import('/script.js')（兼容非官方版/手机端）。 */
@@ -2567,6 +2678,21 @@ async function ctxSaveChat() {
   }
 }
 
+/** 让酒馆重新渲染消息列表；隐藏/删除/恢复后调用。 */
+async function ctxRefreshTavernUI() {
+  const st = await ctxST();
+  try {
+    await st?.printMessages?.();
+  } catch (err) {
+    console.warn('[API 管家] 刷新酒馆消息失败', err);
+  }
+  try {
+    st?.refreshSwipeButtons?.();
+  } catch {
+    /* ignore */
+  }
+}
+
 /** 一次摘要最多处理 4 万字符：80 轮长聊天不会撑爆请求或超时。 */
 const CTX_SUMMARY_CHAR_LIMIT = 40000;
 const CTX_MSG_CHAR_CAP = 8000;
@@ -2582,6 +2708,17 @@ function ctxBatchMessages(target, limit = CTX_SUMMARY_CHAR_LIMIT) {
   return batch.length ? batch : target.slice(0, 4);
 }
 
+/** 压缩期间用户切了聊天：不要把旧聊天的摘要/隐藏套到新聊天上。 */
+function ctxChatUnchanged(chatRef, chatId) {
+  const ctx = getSTContext();
+  if (!ctx) return false;
+  if (chatId != null && ctx.chatId != null) {
+    return String(ctx.chatId) === String(chatId);
+  }
+  if (Array.isArray(ctx.chat) && ctx.chat !== chatRef) return false;
+  return true;
+}
+
 /** 保留最近 keepTurns 轮，其余作为压缩目标。首楼永远不压。 */
 function ctxPlan(keepTurns, chatInput) {
   const visible = ctxMessages(chatInput).filter((message) => !message.hidden);
@@ -2593,29 +2730,60 @@ function ctxPlan(keepTurns, chatInput) {
 }
 
 async function ctxApplySummary(summary, ranges, auto) {
-  await ctxSetPrompt(`【前情提要】\n${summary}`);
   const chats = await ctxChats();
+  const hidden = [];
   for (const [from, to] of ranges) {
     try {
-      if (chats?.hideChatMessageRange) await chats.hideChatMessageRange(from, to, false);
+      if (chats?.hideChatMessageRange) {
+        await chats.hideChatMessageRange(from, to, false);
+        hidden.push([from, to]);
+      }
     } catch (err) {
       console.warn('[API 管家] 隐藏旧消息失败', err);
     }
   }
+  if (!hidden.length) return false;
+
+  const injected = await ctxSetPrompt(`【前情提要】\n${summary}`);
+  if (!injected) {
+    // 注入失败就回滚，别让消息被隐藏了却没有摘要
+    for (const [from, to] of hidden) {
+      try {
+        await chats.hideChatMessageRange(from, to, true);
+      } catch {
+        /* ignore */
+      }
+    }
+    return false;
+  }
+
   const meta = ctxChatMetadata();
   if (meta) {
-    meta[CTX_META_KEY] = { summary, ranges, start: ranges[0]?.[0] ?? 0, end: ranges.at(-1)?.[1] ?? 0, at: Date.now(), auto: !!auto, version: 2 };
+    meta[CTX_META_KEY] = { summary, ranges: hidden, start: hidden[0]?.[0] ?? 0, end: hidden.at(-1)?.[1] ?? 0, at: Date.now(), auto: !!auto, version: 2 };
   }
   await ctxSaveChat();
+  await ctxRefreshTavernUI();
+  return true;
 }
 
 async function ctxApplyHideOnly(ranges) {
   const chats = await ctxChats();
-  for (const [from, to] of ranges) {
-    try {
-      if (chats?.hideChatMessageRange) await chats.hideChatMessageRange(from, to, false);
-    } catch (err) {
-      console.warn('[API 管家] 隐藏消息失败', err);
+  if (!chats?.hideChatMessageRange) {
+    const chat = getSTContext()?.chat;
+    if (Array.isArray(chat)) {
+      for (const [from, to] of ranges) {
+        for (let index = from; index <= to; index += 1) {
+          if (chat[index]) chat[index].is_system = true;
+        }
+      }
+    }
+  } else {
+    for (const [from, to] of ranges) {
+      try {
+        await chats.hideChatMessageRange(from, to, false);
+      } catch (err) {
+        console.warn('[API 管家] 隐藏消息失败', err);
+      }
     }
   }
   const meta = ctxChatMetadata();
@@ -2623,9 +2791,10 @@ async function ctxApplyHideOnly(ranges) {
     meta[CTX_META_KEY] = { mode: 'hide', ranges, start: ranges[0]?.[0] ?? 0, end: ranges.at(-1)?.[1] ?? 0, at: Date.now(), version: 2 };
   }
   await ctxSaveChat();
+  await ctxRefreshTavernUI();
 }
 
-async function ctxCompress({ auto = false, strategy = null } = {}) {
+async function ctxCompress({ auto = false, strategy = null, preview = !auto } = {}) {
   if (ctxBusy) return null;
   if (!auto && ctxGenerating) {
     toast('正在生成回复，稍后再试');
@@ -2633,15 +2802,19 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
   }
   ctxBusy = true;
   let timer = null;
+  let previewing = false;
   try {
     const settings = ctxSettings();
     const mode = strategy ?? settings.strategy ?? 'summary';
     const { chat } = await ctxResolveChat();
+    const chatRef = chat;
+    const chatId = getSTContext()?.chatId ?? null;
     const { visible, target } = ctxPlan(settings.keepTurns, chat);
     if (target.length < 2) {
       if (!auto) {
+        const need = Number(settings.keepTurns) * 2 + 3;
         toast(visible.length
-          ? `只有 ${visible.length} 条可见消息，保留最近 ${settings.keepTurns} 轮后没有可压缩内容`
+          ? `只有 ${visible.length} 条可见消息，至少需要 ${need} 条（保留 ${settings.keepTurns} 轮）才能压缩`
           : '还没有聊天记录');
       }
       return null;
@@ -2650,10 +2823,14 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
     const ranges = ctxGroupRanges(batch.map((message) => message.index));
 
     if (mode === 'hide') {
+      if (!ctxChatUnchanged(chatRef, chatId)) {
+        if (!auto) toast('聊天已切换，本次压缩已取消');
+        return null;
+      }
       await ctxApplyHideOnly(ranges);
       toast(`已隐藏 ${batch.length} 条旧消息`);
       if (ui.currentTab === 'context') void renderContext();
-      return { ranges, count: target.length };
+      return { ranges, count: batch.length };
     }
 
     const connection = ctxActiveConnection();
@@ -2667,9 +2844,19 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
       return null;
     }
 
+    if (!auto && settings.confirmSend !== false && typeof globalThis.confirm === 'function') {
+      const ok = globalThis.confirm(`摘要会把选中的 ${batch.length} 条消息发送给「${connection.name || '当前连接'}」，继续？`);
+      if (!ok) return null;
+    }
+
+    const before = await ctxCountTotal(visible);
     const controller = new AbortController();
     timer = setTimeout(() => controller.abort(), 30000);
+    previewing = !auto && preview;
+    if (previewing) ctxOpenPreview({ controller });
+
     const key = await ctxConnectionKey(connection);
+    const previousSummary = ctxChatMetadata()?.[CTX_META_KEY]?.summary ?? '';
     const transcript = batch
       .map((message) => {
         const text = message.text.length > CTX_MSG_CHAR_CAP
@@ -2678,7 +2865,8 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
         return `${message.isUser ? '用户' : message.name}：${text}`;
       })
       .join('\n');
-    const res = await fetch(`${base}/chat/completions`, {
+    const rawFetch = globalThis.__TAM_RAW_FETCH__ || fetch;
+    const res = await rawFetch(`${base}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -2686,7 +2874,7 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
       },
       body: JSON.stringify({
         model: connection.model || ctxModel(),
-        messages: [{ role: 'user', content: ctxSummaryPrompt(transcript, settings.summaryChars) }],
+        messages: [{ role: 'user', content: ctxSummaryPrompt(transcript, settings.summaryChars, previousSummary) }],
         temperature: 0.3,
         max_tokens: 800,
         stream: false,
@@ -2705,7 +2893,33 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
     const summary = String(data?.choices?.[0]?.message?.content ?? '').trim();
     if (!summary) throw new Error('摘要为空');
 
-    await ctxApplySummary(summary, ranges, auto);
+    if (!ctxChatUnchanged(chatRef, chatId)) {
+      if (previewing) ctxClosePreview();
+      if (!auto) toast('聊天已切换，本次压缩已取消');
+      return null;
+    }
+
+    if (previewing) {
+      const saved = batch.reduce((sum, message) => sum + ctxEstimate(message.text) + 4, 0);
+      const after = Math.max(0, before.tokens - saved + ctxEstimate(summary) + 4);
+      ctxFillPreview({
+        summary,
+        ranges,
+        count: batch.length,
+        targetCount: target.length,
+        before: before.tokens,
+        after,
+        chatRef,
+        chatId,
+      });
+      return { preview: true };
+    }
+
+    const applied = await ctxApplySummary(summary, ranges, auto);
+    if (!applied) {
+      if (!auto) toast('压缩未应用：无法隐藏消息');
+      return null;
+    }
     const extra = batch.length < target.length ? `（本次处理最早的 ${batch.length} 条）` : '';
     toast(auto
       ? `已自动压缩 ${batch.length} 条旧消息${extra}`
@@ -2713,6 +2927,7 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
     if (ui.currentTab === 'context') void renderContext();
     return { summary, ranges, count: batch.length };
   } catch (err) {
+    if (previewing) ctxClosePreview();
     const message = err?.name === 'AbortError' ? '压缩请求超时（30 秒）' : String(err?.message ?? err);
     if (!auto) toast(`压缩失败：${message}`);
     return null;
@@ -2720,6 +2935,105 @@ async function ctxCompress({ auto = false, strategy = null } = {}) {
     if (timer) clearTimeout(timer);
     ctxBusy = false;
   }
+}
+
+let ctxPreviewState = null;
+
+function ctxClosePreview() {
+  const node = $id('tam-ctx-preview');
+  if (node) node.remove();
+  ctxPreviewState = null;
+}
+
+/** 先弹预览（生成中可取消），再决定是否应用。 */
+function ctxOpenPreview({ controller }) {
+  ctxClosePreview();
+  const overlay = el('div', { id: 'tam-ctx-preview' });
+  overlay.addEventListener('click', (event) => {
+    if (event.target === overlay) ctxClosePreview();
+  });
+  const textarea = el('textarea', {
+    id: 'tam-ctx-preview-text',
+    disabled: 'disabled',
+    placeholder: '正在生成摘要…',
+  });
+  const est = el('div', { id: 'tam-ctx-preview-est' }, '正在请求摘要，最多 30 秒…');
+  const actions = el('div', { class: 'tam-ctxactions' });
+  const cancel = el('button', { class: 'tam-ghost', type: 'button', onclick: () => ctxClosePreview() }, '取消');
+  const regen = el('button', {
+    class: 'tam-ghost',
+    type: 'button',
+    disabled: 'disabled',
+    onclick: () => {
+      ctxClosePreview();
+      void ctxCompress({ preview: true });
+    },
+  }, '重新生成');
+  const apply = el('button', {
+    class: 'tam-primary',
+    type: 'button',
+    disabled: 'disabled',
+    onclick: () => {
+      const state = ctxPreviewState;
+      if (!state) return;
+      const text = state.textarea.value.trim();
+      if (!text) {
+        toast('摘要不能为空');
+        return;
+      }
+      if (!ctxChatUnchanged(state.chatRef, state.chatId)) {
+        toast('聊天已切换，已取消');
+        ctxClosePreview();
+        return;
+      }
+      const { ranges, count } = state;
+      ctxClosePreview();
+      void (async () => {
+        const applied = await ctxApplySummary(text, ranges, false);
+        if (!applied) {
+          toast('压缩未应用：无法隐藏消息');
+          return;
+        }
+        toast(`已压缩 ${count} 条 · 摘要 ${text.length} 字`);
+        if (ui.currentTab === 'context') void renderContext();
+      })();
+    },
+  }, '应用压缩');
+  actions.append(cancel, regen, apply);
+
+  overlay.append(
+    el('div', { id: 'tam-ctx-preview-card' },
+      el('h3', {}, '压缩预览'),
+      el('p', { class: 'tam-hint' }, '确认摘要后再隐藏原消息；可以手动修改，取消不会改动聊天。'),
+      textarea,
+      est,
+      actions,
+    ),
+  );
+  ui.root.append(overlay);
+  ctxPreviewState = { textarea, est, apply, regen, cancel, ranges: [], count: 0, chatRef: null, chatId: null };
+  if (controller) {
+    controller.signal.addEventListener('abort', () => ctxClosePreview(), { once: true });
+    ctxPreviewState.cancel.onclick = () => {
+      try { controller.abort(); } catch { /* ignore */ }
+      ctxClosePreview();
+    };
+  }
+}
+
+function ctxFillPreview({ summary, ranges, count, targetCount, before, after, chatRef, chatId }) {
+  const state = ctxPreviewState;
+  if (!state) return;
+  state.ranges = ranges;
+  state.count = count;
+  state.chatRef = chatRef;
+  state.chatId = chatId;
+  state.textarea.disabled = false;
+  state.textarea.value = summary;
+  state.est.textContent = `预计 ${before.toLocaleString()} → ${after.toLocaleString()} tokens · 处理 ${count}${targetCount > count ? `/${targetCount}` : ''} 条`;
+  state.apply.removeAttribute('disabled');
+  state.regen.removeAttribute('disabled');
+  state.textarea.focus();
 }
 
 async function ctxUndo() {
@@ -2757,11 +3071,18 @@ async function ctxUnhideAll() {
     return;
   }
   const chats = await ctxChats();
-  try {
-    await chats?.hideChatMessageRange?.(0, chat.length - 1, true);
-  } catch (err) {
-    toast(`取消隐藏失败：${String(err?.message ?? err)}`);
-    return;
+  if (chats?.hideChatMessageRange) {
+    try {
+      await chats.hideChatMessageRange(0, chat.length - 1, true);
+    } catch (err) {
+      toast(`取消隐藏失败：${String(err?.message ?? err)}`);
+      return;
+    }
+  } else {
+    for (const message of chat) {
+      if (message) message.is_system = false;
+    }
+    await ctxSaveChat();
   }
   await ctxSetPrompt('');
   const meta = ctxChatMetadata();
@@ -2883,13 +3204,26 @@ async function ctxHideSelected(hide) {
   if (!ids.length) return;
   const chats = await ctxChats();
   if (!chats?.hideChatMessageRange) {
-    toast('宿主不支持隐藏消息');
+    const chat = getSTContext()?.chat;
+    if (!Array.isArray(chat)) {
+      toast('宿主不支持隐藏消息');
+      return;
+    }
+    for (const index of ids) {
+      if (chat[index]) chat[index].is_system = hide;
+    }
+    await ctxSaveChat();
+    await ctxRefreshTavernUI();
+    ctxSelected.clear();
+    toast(`${hide ? '已隐藏' : '已取消隐藏'} ${ids.length} 条`);
+    if (ui.currentTab === 'context') void renderContext();
     return;
   }
   const ranges = ctxGroupRanges(ids);
   for (const [from, to] of ranges) {
     await chats.hideChatMessageRange(from, to, !hide);
   }
+  await ctxRefreshTavernUI();
   ctxSelected.clear();
   toast(`${hide ? '已隐藏' : '已取消隐藏'} ${ids.length} 条`);
   if (ui.currentTab === 'context') void renderContext();
@@ -2944,6 +3278,7 @@ async function ctxDeleteSelected() {
   } catch {
     /* ignore */
   }
+  await ctxRefreshTavernUI();
   ctxSelected.clear();
   toast(ids.length > 200
     ? `已删除 ${ids.length} 条（仅最近 200 条可恢复）`
@@ -2977,6 +3312,7 @@ async function ctxRestoreDelete() {
   }
   await st.saveChatConditional();
   if (meta) meta.tamCtxDeleted = list.slice(1);
+  await ctxRefreshTavernUI();
   toast(`已恢复 ${snapshot.messages.length} 条`);
   if (ui.currentTab === 'context') void renderContext();
 }
@@ -3146,21 +3482,52 @@ async function renderContext() {
       `当前预算装不下「保留最近 ${settings.keepTurns} 轮」，建议把保留轮数调小，或把有效预算调大。`));
   }
 
-  if (budget.rawLimit > budget.usable * 4) {
+  const recentReplies = rows.filter((message) => !message.isUser).slice(-3);
+  if (recentReplies.length) {
+    const avgReplyTokens = recentReplies.reduce((sum, message) => sum + (ctxTokenMap.get(message.index) ?? 0), 0) / recentReplies.length;
+    body.append(el('div', { class: 'tam-ctxmeta' },
+      el('span', {}, `近 ${recentReplies.length} 轮平均 +${Math.round(avgReplyTokens)} tokens/条`),
+      el('span', {}, `≈ +${Math.round(avgReplyTokens * 2)}/轮`),
+    ));
+  }
+  if (recentReplies.length) {
+    const avgReply = recentReplies.reduce((sum, message) => sum + (ctxTokenMap.get(message.index) ?? 0), 0) / recentReplies.length;
+    if (total.tokens + avgReply > budget.usable) {
+      body.append(el('p', { class: 'tam-hint tam-hint-warn' },
+        '按最近回复长度，下一轮预计会超出预算：现在压缩一次，或把保留轮数调小。'));
+    }
+  }
+
+  const needMessages = Number(settings.keepTurns) * 2 + 3;
+  if (visible.length < needMessages) {
+    body.append(el('p', { class: 'tam-hint' },
+      `再聊 ${needMessages - visible.length} 条消息就能开始压缩（保留 ${settings.keepTurns} 轮需要至少 ${needMessages} 条）。`));
+  }
+
+  if (visible.length < needMessages && total.tokens >= budget.usable) {
+    body.append(el('p', { class: 'tam-hint tam-hint-warn' },
+      `静态前缀（预设 + 角色卡）已经占到 ${total.tokens.toLocaleString()} tokens，超过可用预算 ${budget.usable.toLocaleString()}；压缩历史没有意义，请换小预设或提高有效预算。`));
+  }
+
+  if (budget.override === 0 && budget.rawLimit > budget.usable * 4) {
     body.append(el('p', { class: 'tam-hint tam-hint-warn' },
       `酒馆上下文设为 ${budget.rawLimit.toLocaleString()}，自动压缩几乎不会触发。建议把“有效预算”设成模型真实上限。`));
   }
 
   body.append(el('div', { class: 'tam-ctxsettings-toggle' },
     el('button', {
-      class: 'tam-ctxlink',
       type: 'button',
+      'aria-expanded': ctxSettingsOpen ? 'true' : 'false',
       onclick: () => {
         ctxSettingsOpen = !ctxSettingsOpen;
         void renderContext();
       },
-    }, ctxSettingsOpen ? '收起压缩设置' : '压缩设置（自动 / 保留轮数 / 预算）'),
+    }, ctxSettingsOpen ? '▾ 收起压缩设置' : '⚙ 压缩设置（自动 / 保留轮数 / 预算）'),
   ));
+
+  const recPromise = ctxSettingsOpen
+    ? ctxRecommendBudget(visible, total.tokens).catch(() => null)
+    : Promise.resolve(null);
 
   if (ctxSettingsOpen) body.append(
     el('div', { class: 'tam-ctxcontrols' },
@@ -3176,6 +3543,18 @@ async function renderContext() {
         })(),
         el('span', { class: 'tam-toggle-track', 'aria-hidden': 'true' }),
         el('span', { class: 'tam-toggle-text' }, '自动压缩'),
+      ),
+      el('label', { class: 'tam-ctxfield' },
+        (() => {
+          const input = el('input', { type: 'checkbox' });
+          input.checked = settings.confirmSend !== false;
+          input.addEventListener('change', () => {
+            saveCtxSettings({ confirmSend: input.checked });
+            toast(input.checked ? '发送摘要前会确认' : '发送摘要不再确认');
+          });
+          return input;
+        })(),
+        el('span', {}, '发送前确认'),
       ),
       el('div', { class: 'tam-ctxfield' },
         el('span', {}, '每聊'),
@@ -3206,11 +3585,12 @@ async function renderContext() {
       ),
       el('div', { class: 'tam-ctxfield' },
         el('span', {}, '有效预算'),
-        ctxSelect('tam-ctx-budget', CTX_BUDGET_CHOICES, settings.budgetOverride, (event) => {
+        ctxSelect('tam-ctx-budget', ctxBudgetOptions(settings.budgetOverride), settings.budgetOverride, (event) => {
           saveCtxSettings({ budgetOverride: Number(event.target.value) || 0 });
           void renderContext();
         }),
       ),
+      el('div', { id: 'tam-ctx-rec-slot', class: 'tam-hint', style: 'flex:1 0 100%;margin:0' }, '正在计算建议档位…'),
       el('p', { class: 'tam-hint' },
         '参考：500 字 → 3 万；1000 字 → 5 万；2000 字 → 5–9 万；5000 字 → 11 万；1 万字 → 13–17 万；2 万字 → 30 万+（需模型支持）。'),
     ),
@@ -3221,7 +3601,7 @@ async function renderContext() {
       el('button', {
         class: 'tam-primary',
         type: 'button',
-        ...(ctxBusy || (settings.strategy !== 'hide' && !ctxActiveConnection()) ? { disabled: 'disabled' } : {}),
+        ...(ctxBusy || ctxGenerating || (settings.strategy !== 'hide' && !ctxActiveConnection()) ? { disabled: 'disabled' } : {}),
         onclick: () => { void ctxCompress({ auto: false }); },
       }, settings.strategy === 'hide' ? '隐藏旧消息' : '立即压缩'),
       el('button', {
@@ -3296,12 +3676,29 @@ async function renderContext() {
     ...rows.map((message, index) => ctxRow(message, each.counts[index] ?? 0)),
   ));
   body.append(el('p', { class: 'tam-hint' },
-    '只改动聊天消息；角色卡、预设、世界书都不会被修改。勾选或输入楼层区间后可直接隐藏 / 删除。'));
+    '隐藏 = 不再发送，但酒馆楼层仍保留（这是酒馆的 /hide 语义）；要移除楼层请用删除。角色卡、预设、世界书只读。'));
+
+  void recPromise.then((recommendation) => {
+    const slot = $id('tam-ctx-rec-slot');
+    if (!slot || !recommendation || seq !== ctxRenderSeq) return;
+    slot.textContent = '';
+    slot.append(
+      `建议 ${Math.round(recommendation.pick / 10000)} 万（前缀约 ${recommendation.prefix.toLocaleString()} + 24 轮 × ${Math.round(recommendation.perTurn)}）；`,
+      el('button', {
+        class: 'tam-ctxlink',
+        type: 'button',
+        onclick: () => {
+          saveCtxSettings({ budgetOverride: recommendation.pick });
+          void renderContext();
+        },
+      }, '应用'),
+    );
+  });
 }
 
 /** 给测试用的纯函数出口。 */
 if (typeof globalThis === 'object') {
-  globalThis.__TAM_CTX__ = { ctxEstimate, ctxSummaryPrompt, ctxPlan, ctxBudget, ctxCountTotal, ctxGroupRanges, ctxAutoDecision, ctxBatchMessages, getSelected: () => [...ctxSelected] };
+  globalThis.__TAM_CTX__ = { ctxEstimate, ctxSummaryPrompt, ctxPlan, ctxBudget, ctxCountTotal, ctxGroupRanges, ctxAutoDecision, ctxBatchMessages, ctxChatUnchanged, ctxRecommendBudget, ctxConnectionKey, getSelected: () => [...ctxSelected] };
 }
 
 const FORMAT_CANDIDATES = [
@@ -3554,6 +3951,20 @@ ui.importCurrentConfig = async () => {
 };
 
 /** 构造导出数据；withKeys=false 时抹掉明文 Key。 */
+/** 导出时如果本地没有明文，就从宿主 secrets 里按 secretRef 补回来。 */
+async function attachStoredKeys(payload) {
+  const state = await secrets.state();
+  for (const item of payload.items ?? []) {
+    if (item.key) continue;
+    const slot = `api_key_${sourceOf(item)}`;
+    const list = Array.isArray(state?.[slot]) ? state[slot] : [];
+    const hit = list.find((entry) => entry.id === item.secretRef?.id)
+      ?? list.find((entry) => entry.active)
+      ?? list[0];
+    if (hit?.value) item.key = hit.value;
+  }
+}
+
 function buildExportPayload(withKeys) {
   const items = (loadSettings().items ?? []).map((item) => ({
     ...item,
@@ -3569,7 +3980,7 @@ function buildExportPayload(withKeys) {
 }
 
 /** 导出本地配置为 JSON 文件（默认询问是否带明文 Key）。 */
-ui.exportConfig = (options) => {
+ui.exportConfig = async (options) => {
   const items = loadSettings().items ?? [];
   if (!items.length) {
     toast('没有可导出的配置');
@@ -3586,6 +3997,7 @@ ui.exportConfig = (options) => {
 
   try {
     const payload = buildExportPayload(withKeys);
+    if (withKeys) await attachStoredKeys(payload);
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -3624,6 +4036,7 @@ ui.importConfig = async (event) => {
 
     const settings = loadSettings();
     const map = new Map((settings.items ?? []).map((item) => [item.id, item]));
+    const pendingWrites = [];
     let added = 0;
     let updated = 0;
     let skipped = 0;
@@ -3641,6 +4054,7 @@ ui.importConfig = async (event) => {
       }
       const id = textOf(raw.id, 64) || makeId();
       const existing = map.get(id);
+      const incomingKey = textOf(raw.key, 512) || existing?.key || '';
       const record = {
         id,
         name: textOf(raw.name, 120) || '未命名',
@@ -3648,7 +4062,7 @@ ui.importConfig = async (event) => {
         provider: textOf(raw.provider, 60),
         model: textOf(raw.model, 120),
         // 脱敏导出里 key 为空：不要覆盖本地已有的 Key
-        key: textOf(raw.key, 512) || existing?.key || '',
+        key: incomingKey,
         secretRef:
           raw.secretRef && typeof raw.secretRef === 'object' && raw.secretRef.id
             ? { key: textOf(raw.secretRef.key, 80), id: textOf(raw.secretRef.id, 80) }
@@ -3656,9 +4070,27 @@ ui.importConfig = async (event) => {
         imported: true,
         updatedAt: Number(raw.updatedAt) || Date.now(),
       };
+
+      // 导入的 Key 稍后并发写入宿主机密存储，localStorage 里就不必留明文
+      if (record.key) pendingWrites.push(record);
       if (map.has(id)) updated += 1;
       else added += 1;
       map.set(id, record);
+    }
+
+    // 6 路并发写入，500 条导入不会串行卡死
+    for (let i = 0; i < pendingWrites.length; i += 6) {
+      await Promise.all(pendingWrites.slice(i, i + 6).map(async (record) => {
+        try {
+          const written = await secrets.write(`api_key_${sourceOf(record)}`, record.key, record.name);
+          if (written?.id) {
+            record.secretRef = written;
+            record.key = '';
+          }
+        } catch {
+          /* 普通酒馆没有 secrets 路由时保留明文 */
+        }
+      }));
     }
 
     const truncated = incoming.length > IMPORT_LIMIT;
@@ -3939,6 +4371,8 @@ if (document.readyState === 'loading') {
 } else {
   void boot();
 }
+
+
 
 
 

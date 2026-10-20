@@ -16,7 +16,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $src = Split-Path -Parent $MyInvocation.MyCommand.Path
-$name = 'tauri-api-manager'
+$name = Split-Path -Leaf $src
 
 if (-not $DataDir) {
     $DataDir = Join-Path $env:APPDATA 'com.tauritavern.client\data'
@@ -48,4 +48,3 @@ Write-Host ""
 Write-Host "如果悬浮球没有出现，再执行一次并指定备用目录：" -ForegroundColor Yellow
 Write-Host "  pwsh -File .\install.ps1 -DataDir `"$DataDir`"" -ForegroundColor DarkGray
 Write-Host "  然后把 $target 整个复制到 $DataDir\default-user\extensions\$name" -ForegroundColor DarkGray
-
