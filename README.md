@@ -294,6 +294,8 @@ pwsh -File .\build-script-json.ps1 -OutFile "D:\TauriTavern\js\api-floating-mana
 ```
 
 导入手机：酒馆助手 → 脚本库 → 全局 → 导入 → 选这个 JSON → 打开开关。脚本 id 不变，重复导入会覆盖旧脚本，配置不会丢。
+可以请我的大肥鱼吃点token吗
+<img width="1341" height="1827" alt="感谢兄弟们" src="https://github.com/user-attachments/assets/16c7f32f-1f5d-4b8a-a466-8f517cb4a565" />
 
 
 
