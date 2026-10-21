@@ -1,10 +1,8 @@
--这个预设是我根据改动夏瑾_天琴座_V2_Beta_1.0改的，因为我要使用手机的llocal dream生图里面应该会有每轮对话都生成提示词，如果用不到的话请删掉!!
-
-#Context & API Manager
+# Context & API Manager
 
 TauriTavern / SillyTavern 的常驻悬浮面板：多 API 一键切换、用量统计、上下文压缩。
 
-> 当前版本：**0.8.2** · 适用于 TauriTavern 2.3.0（SillyTavern 1.18 前端）
+> 当前版本：**0.8.3** · 适用于 TauriTavern 2.3.0（SillyTavern 1.18 前端）
 > Windows 客户端 / Android 客户端 / 普通 SillyTavern 网页版（本地模式）
 >
 > 手机端发布包：`Context & API Manager.json`（酒馆助手脚本列表同名）
@@ -40,7 +38,7 @@ api-floating-manager/
 ├─ pc/                         电脑端扩展源码
 │  ├─ index.js  style.css  manifest.json
 │  ├─ install.ps1
-│  └─ tests/                   13 套回归测试（可直接 node 跑）
+│  └─ tests/                   14 套回归测试（可直接 node 跑）
 ├─ mobile/                     手机端补丁与构建
 │  ├─ mobile.js
 │  ├─ build-mobile.ps1
@@ -169,7 +167,7 @@ api-floating-manager/
 
 ## 四、测试矩阵
 
-13 套测试（`pc/tests/`，直接 `node pc/tests/xxx.test.mjs`）：
+14 套测试（`pc/tests/`，直接 `node pc/tests/xxx.test.mjs`）：
 
 | 套件 | 覆盖 |
 |---|---|
@@ -182,6 +180,8 @@ api-floating-manager/
 | diagnostics | URL 脱敏、storeKeys 迁移、纯网页保留旧 Key、开发者模式、临时连接清理、错误区块 |
 | preview-abort | 预览取消真正 abort、关闭界面、损坏 meta 撤销不抛异常 |
 | image-safe | `<local_img>` / `<loacl_img>` / HTML / Markdown 图片楼层不压缩、保持可见、总结请求不含图片提示词 |
+| image-trim | 压图模式只保留图片标签、压掉正文、撤销恢复原文 |
+| image-trim | 每轮生图时 `imagePolicy=trim` 保留图片标签、压掉正文、总结注入、撤销恢复原文 |
 | summary-rows-brutal | 5000 行封顶、HTML/script 渲染、重复弹层、50k 字拒绝保存、事件风暴 |
 | multi-api | 连接 / 切换 / 密钥 / 导入导出 / 悬浮球 / 故障转移 |
 | usage | JSON/SSE usage 提取、错误不计数、31 天裁剪、清空 |
@@ -224,6 +224,7 @@ api-floating-manager/
 
 ## 六、版本历史
 
+- **0.8.3**：自动压缩旧值 5 轮迁移为 2 轮；修复 activeId 指向宿主连接时「立即压缩」置灰；当前酒馆 API 优先匹配插件连接；预设切换后同步 activeId；补充 `reasoning_effort=min` 422 说明
 - **0.8.2**：图片消息保护 + 可选压图模式（保留标签、压正文、撤销恢复）；总结硬上限 220 字防止滚雪球；密钥读取改走 `/api/secrets/find`（read 返回掩码时不再 401）；完整 endpoint 自动去 `/chat/completions`；自动压缩新增“每 2 轮”；CSS 变量/圆角/手机端高度修正；预览取消真正中止请求；`secrets.write` 记录 HTTP 状态；补充 13 套测试
 - **0.8.1**：宿主默认不写明文 Key + 旧数据迁移；最近错误环形队列；诊断脱敏 / 开发者模式 / 一键清理临时连接；自动压缩改为 `tam:request-measured` 事件驱动 + 消息指纹校验；总结改为条目式（表格查看，同段对话比段落式少约 39–46% output tokens）；全面更名 `Context & API Manager`
 - **0.8.0**：总结请求兼容思考模型（thinking.disabled / 空正文重试 / 400 退回 / 本地兜底）；查看/编辑总结界面；楼层区间工具条排版；真实请求大小采集与静态前缀；自动压缩与档位建议计入前缀；档位公式修正
@@ -295,11 +296,11 @@ pwsh -File .\build-script-json.ps1 -OutFile "D:\TauriTavern\js\api-floating-mana
 
 导入手机：酒馆助手 → 脚本库 → 全局 → 导入 → 选这个 JSON → 打开开关。脚本 id 不变，重复导入会覆盖旧脚本，配置不会丢。
 
+## 八、附：轻舟 · 通用预设
 
-可以请我的大肥鱼吃点token吗
-<img width="1341" height="1827" alt="感谢兄弟们" src="https://github.com/user-attachments/assets/16c7f32f-1f5d-4b8a-a466-8f517cb4a565" />
+根目录的 `轻舟·通用预设.json` 是配套的轻量通用预设（不是扩展源码）：约 490 DeepSeek tokens，不绑定模型、不写死剧情。在酒馆「预设 → 导入」里选择它即可；不需要可以删除，不影响扩展。
 
-## 八、许可与支持
+## 九、许可与支持
 
 - 许可：[LICENSE .md](LICENSE%20.md)
 - 问题排查：先看面板「诊断 → 最近错误」，再带脱敏诊断信息反馈。
