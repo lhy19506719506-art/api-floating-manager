@@ -1,10 +1,8 @@
--这个预设是我根据改动夏瑾_天琴座_V2_Beta_1.0改的，因为我要使用手机的llocal dream生图里面应该会有每轮对话都生成提示词，如果用不到的话请删掉!!
-
 # Context & API Manager
 
 TauriTavern / SillyTavern 的常驻悬浮面板：多 API 一键切换、用量统计、上下文压缩。
 
-> 当前版本：**0.8.3** · 适用于 TauriTavern 2.3.0（SillyTavern 1.18 前端）
+> 当前版本：**0.8.4** · 适用于 TauriTavern 2.3.0（SillyTavern 1.18 前端）
 > Windows 客户端 / Android 客户端 / 普通 SillyTavern 网页版（本地模式）
 >
 > 手机端发布包：`Context & API Manager.json`（酒馆助手脚本列表同名）
@@ -226,7 +224,8 @@ api-floating-manager/
 
 ## 六、版本历史
 
-- **0.8.3**：自动压缩旧值 5 轮迁移为 2 轮；修复 activeId 指向宿主连接时「立即压缩」置灰；当前酒馆 API 优先匹配插件连接；预设切换后同步 activeId；补充 `reasoning_effort=min` 422 说明
+- **0.8.4**：修复「立即压缩：Failed to fetch」——WebView 直连第三方 API 被 CORS/CSP 拦截时自动改走酒馆宿主 `/api/backends/chat-completions/generate`，并记住本次会话后续请求；页面无明文 Key 时直连 401 也会回退宿主密钥库；原生源没有 Base URL 时也能走宿主压缩；宿主总结请求补 `include_reasoning:false` 并绕过插件自己的用量/故障切换 fetch hook；总结请求硬上限改为真正 4 万字符（含角色名前缀）；导出「含明文 Key」时改用 `/api/secrets/find` 取明文；撤销压图前校验消息未被编辑；新增网络故障/随机故障两套测试（共 16 套）
+- **0.8.3**：自动压缩旧值 5 轮迁移为 2 轮；修复 activeId 指向宿主连接时「立即压缩」置灰；当前酒馆 API 优先匹配插件连接；预设切换后同步 activeId；图片楼占满待压缩区时自动临时压图（手动/自动压缩都不会再因图片保护直接失败）；补充 `reasoning_effort=min` 422 说明
 - **0.8.2**：图片消息保护 + 可选压图模式（保留标签、压正文、撤销恢复）；总结硬上限 220 字防止滚雪球；密钥读取改走 `/api/secrets/find`（read 返回掩码时不再 401）；完整 endpoint 自动去 `/chat/completions`；自动压缩新增“每 2 轮”；CSS 变量/圆角/手机端高度修正；预览取消真正中止请求；`secrets.write` 记录 HTTP 状态；补充 13 套测试
 - **0.8.1**：宿主默认不写明文 Key + 旧数据迁移；最近错误环形队列；诊断脱敏 / 开发者模式 / 一键清理临时连接；自动压缩改为 `tam:request-measured` 事件驱动 + 消息指纹校验；总结改为条目式（表格查看，同段对话比段落式少约 39–46% output tokens）；全面更名 `Context & API Manager`
 - **0.8.0**：总结请求兼容思考模型（thinking.disabled / 空正文重试 / 400 退回 / 本地兜底）；查看/编辑总结界面；楼层区间工具条排版；真实请求大小采集与静态前缀；自动压缩与档位建议计入前缀；档位公式修正
