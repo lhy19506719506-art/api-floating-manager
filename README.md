@@ -1,3 +1,5 @@
+-这个预设是我根据改动夏瑾_天琴座_V2_Beta_1.0改的，因为我要使用手机的llocal dream生图里面应该会有每轮对话都生成提示词，如果用不到的话请删掉!!
+
 # Context & API Manager
 
 TauriTavern / SillyTavern 的常驻悬浮面板：多 API 一键切换、用量统计、上下文压缩。
